@@ -1,0 +1,32 @@
+<div class="title-row"><div><h1>Настройки</h1><div class="subtitle">Интеграции, адреса, бот и безопасность</div></div></div>
+<form method="post" action="/admin/settings">
+<div class="grid-settings">
+<section class="section"><div class="section-head"><div><h2>Интеграции</h2><p>Секретные значения никогда не отображаются после сохранения</p></div></div><div class="form-panel">
+<div class="form-row"><label>Публичный адрес сервиса</label><div><input name="public_base_url" value="{{config.public_base_url}}" placeholder="https://vpn.example.com"><div class="hint">Webhook: {{config.public_base_url}}/webhooks/lava · Оферта: {{config.public_base_url}}/offer</div></div></div>
+<div class="form-row"><label>Lava.top offer ID</label><div class="secret"><input name="name_lava_offer_id" value="{{secret_status.lava_offer_id.label}}" aria-label="Имя секрета"><input type="password" name="lava_offer_id" autocomplete="new-password" placeholder="Введите новое значение"><span class="secret-status {{'ok' if secret_status.lava_offer_id.configured else ''}}">{{'● Сохранён · значение скрыто' if secret_status.lava_offer_id.configured else '○ Не настроен'}}</span></div></div>
+<div class="form-row"><label>Lava.top API URL</label><input name="lava_api_url" value="{{config.lava_api_url}}" placeholder="https://gate.lava.top"></div>
+<div class="form-row"><label>Путь создания счёта</label><input name="lava_invoice_path" value="{{config.lava_invoice_path}}" placeholder="/api/v3/invoice"></div>
+<div class="form-row"><label>Провайдер платежа</label><input name="lava_payment_provider" value="{{config.lava_payment_provider}}" placeholder="Оставьте пустым для выбора Lava.top"></div>
+{% for key,title in [('lava_api_key','API key Lava.top'),('lava_webhook_key','Ключ webhook Lava.top')] %}<div class="form-row"><label>{{title}}</label><div class="secret"><input name="name_{{key}}" value="{{secret_status[key].label}}" aria-label="Имя секрета"><input type="password" name="{{key}}" autocomplete="new-password" placeholder="Введите новое значение"><span class="secret-status {{'ok' if secret_status[key].configured else ''}}">{{'● Сохранён · значение скрыто' if secret_status[key].configured else '○ Не настроен'}}</span></div></div>{% endfor %}
+<div class="form-row"><label>Адрес панели 3x-ui</label><input name="xui_base_url" value="{{config.xui_base_url}}" placeholder="https://panel.example.com:2053"></div>
+<div class="form-row"><label>Путь API 3x-ui</label><input name="xui_api_base_path" value="{{config.xui_api_base_path}}" placeholder="/panel/api"></div>
+<div class="form-row"><label>Путь входа 3x-ui</label><input name="xui_login_path" value="{{config.xui_login_path}}" placeholder="/login"></div>
+<div class="form-row"><label>ID inbound</label><input name="xui_inbound_id" type="number" min="1" value="{{config.xui_inbound_id}}"></div>
+<div class="form-row"><label>Логин 3x-ui</label><div class="secret"><input name="name_xui_username" value="{{secret_status.xui_username.label}}" aria-label="Имя секрета"><input type="password" name="xui_username" autocomplete="new-password" placeholder="Введите новое значение"><span class="secret-status {{'ok' if secret_status.xui_username.configured else ''}}">{{'● Сохранён · значение скрыто' if secret_status.xui_username.configured else '○ Не настроен'}}</span></div></div>
+{% for key,title in [('xui_api_token','API token 3x-ui'),('xui_password','Пароль 3x-ui')] %}<div class="form-row"><label>{{title}}</label><div class="secret"><input name="name_{{key}}" value="{{secret_status[key].label}}" aria-label="Имя секрета"><input type="password" name="{{key}}" autocomplete="new-password" placeholder="Введите новое значение"><span class="secret-status {{'ok' if secret_status[key].configured else ''}}">{{'● Сохранён · значение скрыто' if secret_status[key].configured else '○ Не настроен'}}</span></div></div>{% endfor %}
+<div class="form-row"><label>Базовый URL Happ-подписки</label><input name="happ_subscription_base" value="{{config.happ_subscription_base}}" placeholder="https://panel.example.com"></div>
+<div class="form-row"><label>Путь Happ-подписки</label><input name="happ_subscription_path" value="{{config.happ_subscription_path}}" placeholder="/sub"></div>
+<div class="form-row"><label>Напоминания, дней</label><input name="reminder_days" value="{{config.reminder_days}}" placeholder="3,1"></div>
+<div class="form-row"><label>Часовой пояс</label><input name="timezone" value="{{config.timezone}}" placeholder="Asia/Novosibirsk"></div>
+</div></section>
+<section class="section" id="bot"><div class="section-head"><div><h2>Telegram-бот и оферта</h2><p>Текст приветствия и веб-страница условий</p></div></div><div class="form-panel">
+<div class="form-row"><label>Текст /start</label><textarea name="bot_welcome_text">{{config.bot_welcome_text}}</textarea></div>
+<div class="form-row"><label>Текст оферты</label><textarea name="offer_text">{{config.offer_text}}</textarea><div class="hint">Страница будет доступна по адресу {{config.public_base_url}}/offer</div></div>
+<div class="form-row"><label>Токен бота</label><div class="secret"><input name="name_bot_token" value="{{secret_status.bot_token.label}}" aria-label="Имя секрета"><input type="password" name="bot_token" autocomplete="new-password" placeholder="Введите новый токен"><span class="secret-status {{'ok' if secret_status.bot_token.configured else ''}}">{{'● Сохранён · значение скрыто' if secret_status.bot_token.configured else '○ Не настроен'}}</span></div></div>
+<div class="hint">После замены токена polling бота перезапускается автоматически.</div>
+</div>
+</section>
+</div>
+<section class="section"><div class="section-head"><div><h2>Доступ к панели</h2><p>Пароль сохраняется только как хеш</p></div></div><div class="form-panel"><div class="form-row"><label>Имя администратора</label><input name="admin_username" value="{{admin_username}}"></div><div class="form-row"><label>Новый пароль</label><input name="admin_password" type="password" autocomplete="new-password" placeholder="Оставьте пустым, чтобы не менять"></div><div class="hint">После смены учётных данных браузер запросит вход повторно.</div></div></section>
+<div class="toolbar"><button>Сохранить настройки</button><span class="mini">Пустые поля секретов оставляют прежние значения без показа.</span></div>
+</form>

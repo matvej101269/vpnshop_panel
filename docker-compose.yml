@@ -1,0 +1,11 @@
+services:
+  vpnshop:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - vpnshop-data:/app/data
+    ports:
+      - "127.0.0.1:8000:8000"
+volumes:
+  vpnshop-data:
