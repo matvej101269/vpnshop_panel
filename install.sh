@@ -41,7 +41,7 @@ if [[ "$PANEL_PORT" == 8000 ]]; then echo "Port 8000 is reserved for the app beh
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y ca-certificates curl git docker.io docker-compose nginx certbot openssl
+apt-get install -y ca-certificates curl git docker.io docker-compose-v2 nginx certbot openssl
 systemctl enable --now docker
 systemctl enable nginx
 
@@ -122,7 +122,7 @@ HOOK
 chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-vpnshop-nginx
 
 cd "$INSTALL_DIR"
-docker-compose up -d --build
+docker compose up -d --build
 systemctl reload nginx
 
 CREDENTIALS_FILE="/root/vpnshop-admin.txt"
