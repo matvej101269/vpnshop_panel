@@ -1,12 +1,16 @@
+import asyncio
+import logging
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.exceptions import TelegramNetworkError, TelegramServerError, TelegramUnauthorizedError
 from sqlalchemy import select
 from app.db import SessionLocal, Plan, PendingPayment
 from app.services import LavaClient
 from app.runtime_config import get_config
 
 dp = Dispatcher()
+logger = logging.getLogger(__name__)
 
 
 @dp.message(CommandStart())
@@ -42,8 +46,22 @@ async def buy(callback: CallbackQuery):
 
 
 async def start_bot(token: str):
-    bot = Bot(token)
-    await dp.start_polling(bot)
+    delay = 5
+    while True:
+        bot = Bot(token)
+        try:
+            logger.info("Connecting Telegram bot via long polling")
+            await dp.start_polling(bot)
+            return
+        except (TelegramNetworkError, TelegramServerError) as exc:
+            logger.warning("Telegram connection failed; retrying in %s seconds: %s", delay, exc)
+        except TelegramUnauthorizedError:
+            logger.error("Telegram rejected the bot token; update it in admin settings")
+            return
+        finally:
+            await bot.session.close()
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 300)
 
 
 async def notify_user(telegram_id: int, text: str):
