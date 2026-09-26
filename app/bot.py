@@ -1,9 +1,11 @@
 import asyncio
+import ipaddress
 import logging
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.exceptions import TelegramNetworkError, TelegramServerError, TelegramUnauthorizedError
+from urllib.parse import urlsplit
 from sqlalchemy import select
 from app.db import SessionLocal, Plan, PendingPayment
 from app.services import LavaClient
@@ -13,6 +15,20 @@ dp = Dispatcher()
 logger = logging.getLogger(__name__)
 
 
+def is_public_http_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme not in {"http", "https"} or not host:
+        return False
+    if host == "localhost" or host.endswith((".localhost", ".local")):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return not (address.is_private or address.is_loopback or address.is_link_local or address.is_unspecified)
+
+
 @dp.message(CommandStart())
 async def start(message: Message):
     with SessionLocal() as db:
@@ -20,7 +36,7 @@ async def start(message: Message):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
             text=f"{p.name} — {p.amount} {p.currency}", callback_data=f"buy:{p.id}")] for p in plans])
         base = get_config("public_base_url").rstrip("/")
-        if base:
+        if is_public_http_url(base):
             keyboard.inline_keyboard.append([InlineKeyboardButton(text="Договор оферты", url=f"{base}/offer")])
     await message.answer(get_config("bot_welcome_text"), reply_markup=keyboard)
 
