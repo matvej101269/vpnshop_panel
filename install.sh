@@ -45,6 +45,11 @@ apt-get install -y ca-certificates curl git docker.io docker-compose nginx certb
 systemctl enable --now docker
 systemctl enable nginx
 
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q 'Status: active'; then
+  ufw allow 80/tcp
+  ufw allow "$PANEL_PORT/tcp"
+fi
+
 mkdir -p /var/www/certbot/.well-known/acme-challenge
 cat >/etc/nginx/sites-available/vpnshop <<'NGINX_HTTP'
 server {
@@ -115,11 +120,6 @@ cat >/etc/letsencrypt/renewal-hooks/deploy/reload-vpnshop-nginx <<'HOOK'
 systemctl reload nginx
 HOOK
 chmod 755 /etc/letsencrypt/renewal-hooks/deploy/reload-vpnshop-nginx
-
-if command -v ufw >/dev/null 2>&1 && ufw status | grep -q 'Status: active'; then
-  ufw allow 80/tcp
-  ufw allow "$PANEL_PORT/tcp"
-fi
 
 cd "$INSTALL_DIR"
 docker-compose up -d --build
