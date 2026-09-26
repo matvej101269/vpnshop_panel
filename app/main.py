@@ -12,7 +12,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, func
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings as env_settings
-from app.db import (init_db, SessionLocal, Plan, PendingPayment, Subscription,
+from app.db import (init_db, SessionLocal, Plan, BotMenuNode, PendingPayment, Subscription,
                     SubscriptionHistory, AdminAccount)
 from app.services import provision_paid_invoice, XUIClient
 from app.bot import start_bot, notify_user
@@ -24,7 +24,7 @@ templates = Jinja2Templates(directory="app/templates")
 security = HTTPBasic()
 scheduler = AsyncIOScheduler(timezone=env_settings.timezone)
 bot_task: asyncio.Task | None = None
-SECTIONS = {"overview", "users", "subscriptions", "history", "settings"}
+SECTIONS = {"overview", "users", "subscriptions", "history", "settings", "botmenu"}
 SECRET_LABELS = {
     "bot_token": "name_bot_token", "lava_api_key": "name_lava_api_key", "lava_offer_id": "name_lava_offer_id",
     "lava_webhook_key": "name_lava_webhook_key", "xui_password": "name_xui_password",
@@ -227,7 +227,100 @@ async def admin_page(section: str, request: Request, _: None = Depends(admin)):
             account = db.scalar(select(AdminAccount).limit(1))
             ctx.update(config=config, secret_status=config_status(),
                        admin_username=account.username if account else env_settings.admin_user)
+        elif section == "botmenu":
+            nodes = db.scalars(select(BotMenuNode).order_by(BotMenuNode.position, BotMenuNode.id)).all()
+            by_parent = {}
+            for node in nodes:
+                by_parent.setdefault(node.parent_id, []).append(node)
+            menu_rows = []
+            def walk(parent_id, depth=0):
+                for node in by_parent.get(parent_id, []):
+                    menu_rows.append({"node": node, "depth": depth})
+                    walk(node.id, depth + 1)
+            walk(None)
+            ctx.update(menu_rows=menu_rows)
         return templates.TemplateResponse(request, "admin_base.html", ctx | {"section_body": f"admin_{section}.html"})
+
+
+def validate_menu_values(form, db, current_id: int | None = None):
+    label = str(form.get("label", "")).strip()
+    action = str(form.get("action", "menu")).strip()
+    text_value = str(form.get("text", "")).strip()
+    url = str(form.get("url", "")).strip()
+    parent_raw = str(form.get("parent_id", "")).strip()
+    if not label or len(label) > 64:
+        raise HTTPException(status_code=400, detail="Название кнопки должно быть от 1 до 64 символов")
+    if action not in {"menu", "plans", "url"}:
+        raise HTTPException(status_code=400, detail="Неизвестное действие кнопки")
+    parent_id = int(parent_raw) if parent_raw.isdigit() and int(parent_raw) > 0 else None
+    if parent_id is not None:
+        parent = db.get(BotMenuNode, parent_id)
+        if not parent or not parent.enabled or parent.action != "menu" or parent_id == current_id:
+            raise HTTPException(status_code=400, detail="Выберите доступное родительское меню")
+        ancestor_id = parent.parent_id
+        while ancestor_id is not None:
+            if ancestor_id == current_id:
+                raise HTTPException(status_code=400, detail="Нельзя переместить меню внутрь самого себя")
+            ancestor = db.get(BotMenuNode, ancestor_id)
+            ancestor_id = ancestor.parent_id if ancestor else None
+    if action == "url":
+        from urllib.parse import urlsplit
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.netloc or len(url) > 500:
+            raise HTTPException(status_code=400, detail="Для ссылки кнопки укажите корректный HTTPS URL")
+    elif url:
+        raise HTTPException(status_code=400, detail="URL используется только для действия «Открыть ссылку»")
+    position_raw = str(form.get("position", "0")).strip()
+    try:
+        position = max(0, min(9999, int(position_raw or 0)))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Порядок должен быть целым числом")
+    return {"parent_id": parent_id, "label": label, "action": action,
+            "text": text_value[:4000], "url": url, "position": position,
+            "enabled": str(form.get("enabled", "")) == "on"}
+
+
+@app.post("/admin/botmenu")
+async def create_bot_menu_node(request: Request, _: None = Depends(admin)):
+    form = await checked_form(request)
+    with SessionLocal() as db:
+        node = BotMenuNode(**validate_menu_values(form, db))
+        db.add(node)
+        db.commit()
+    return RedirectResponse("/admin/botmenu", status_code=303)
+
+
+@app.post("/admin/botmenu/{node_id}/edit")
+async def edit_bot_menu_node(node_id: int, request: Request, _: None = Depends(admin)):
+    form = await checked_form(request)
+    with SessionLocal() as db:
+        node = db.get(BotMenuNode, node_id)
+        if not node:
+            raise HTTPException(status_code=404, detail="Кнопка не найдена")
+        values = validate_menu_values(form, db, node_id)
+        has_children = db.scalars(select(BotMenuNode).where(BotMenuNode.parent_id == node_id)).first()
+        if values["action"] != "menu" and has_children:
+            raise HTTPException(status_code=409, detail="Сначала переместите или удалите вложенные кнопки")
+        for key, value in values.items():
+            setattr(node, key, value)
+        db.commit()
+    return RedirectResponse("/admin/botmenu", status_code=303)
+
+
+@app.post("/admin/botmenu/{node_id}/delete")
+async def delete_bot_menu_node(node_id: int, request: Request, _: None = Depends(admin)):
+    await checked_form(request)
+    with SessionLocal() as db:
+        node = db.get(BotMenuNode, node_id)
+        if node:
+            def remove_tree(parent_id):
+                for child in db.scalars(select(BotMenuNode).where(BotMenuNode.parent_id == parent_id)).all():
+                    remove_tree(child.id)
+                    db.delete(child)
+            remove_tree(node_id)
+            db.delete(node)
+            db.commit()
+    return RedirectResponse("/admin/botmenu", status_code=303)
 
 
 @app.post("/admin/subscriptions")
@@ -371,4 +464,3 @@ async def update_settings(request: Request, _: None = Depends(admin)):
         save_admin_account(new_username, new_password)
     await restart_bot_runtime()
     return RedirectResponse("/admin/settings", status_code=303)
-

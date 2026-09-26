@@ -1,0 +1,25 @@
+<div class="title-row"><div><h1>Конструктор Telegram-бота</h1><div class="subtitle">Собирайте меню из кнопок и вложенных разделов. Настройки меню не содержат данных пользователей.</div></div></div>
+<section class="section"><div class="section-head"><div><h2>Как устроено меню</h2><p>Кнопки верхнего уровня показываются после /start. «Подменю» открывает вложенные кнопки, «Тарифы» показывает активные планы для покупки.</p></div></div><div class="form-panel"><div class="hint">Тип «Ссылка» открывает HTTPS-адрес. Текст меню показывается при нажатии. Кнопка «Назад» добавляется автоматически. При пустом меню /start продолжает показывать тарифы и оферту.</div></div></section>
+
+<section class="section"><div class="section-head"><div><h2>Добавить кнопку</h2><p>Чтобы сделать кнопку вложенной, выберите родительское меню</p></div></div>
+<form method="post" action="/admin/botmenu" class="form-panel">
+<div class="form-row"><label>Название кнопки</label><input name="label" maxlength="64" placeholder="Например, Информация" required></div>
+<div class="form-row"><label>Родительское меню</label><select name="parent_id"><option value="">Главное меню /start</option>{% for row in menu_rows %}{% if row.node.action == 'menu' and row.node.enabled %}<option value="{{row.node.id}}">{{'— ' * (row.depth + 1)}}{{row.node.label}}</option>{% endif %}{% endfor %}</select></div>
+<div class="form-row"><label>Действие</label><select name="action"><option value="menu">Открыть подменю</option><option value="plans">Показать тарифы</option><option value="url">Открыть ссылку</option></select></div>
+<div class="form-row"><label>Текст сообщения</label><textarea name="text" maxlength="4000" placeholder="Текст, который увидит пользователь при открытии меню или списка тарифов"></textarea></div>
+<div class="form-row"><label>HTTPS-ссылка</label><input name="url" type="url" placeholder="https://example.com" maxlength="500"></div>
+<div class="form-row"><label>Порядок / активность</label><div class="toolbar"><input name="position" type="number" min="0" max="9999" value="0"><label><input class="check" type="checkbox" name="enabled" checked> <span class="mini">Показывать кнопку</span></label></div></div>
+<button>Добавить кнопку</button></form></section>
+
+<section class="section"><div class="section-head"><div><h2>Дерево меню</h2><p>{{menu_rows|length}} кнопок</p></div></div><div class="form-panel">
+{% for row in menu_rows %}{% set n = row.node %}<details class="section" style="margin:10px 0"><summary style="padding:13px;cursor:pointer">{{'— ' * row.depth}}{{n.label}} <span class="pill {{'off' if not n.enabled else ''}}">{{'Выключена' if not n.enabled else {'menu':'Подменю','plans':'Тарифы','url':'Ссылка'}[n.action]}}</span></summary>
+<form method="post" action="/admin/botmenu/{{n.id}}/edit" class="form-panel">
+<div class="form-row"><label>Название кнопки</label><input name="label" maxlength="64" value="{{n.label}}" required></div>
+<div class="form-row"><label>Родительское меню</label><select name="parent_id"><option value="" {{'selected' if n.parent_id is none else ''}}>Главное меню /start</option>{% for parent in menu_rows %}{% if parent.node.id != n.id and parent.node.action == 'menu' and parent.node.enabled %}<option value="{{parent.node.id}}" {{'selected' if n.parent_id == parent.node.id else ''}}>{{'— ' * (parent.depth + 1)}}{{parent.node.label}}</option>{% endif %}{% endfor %}</select></div>
+<div class="form-row"><label>Действие</label><select name="action"><option value="menu" {{'selected' if n.action == 'menu' else ''}}>Открыть подменю</option><option value="plans" {{'selected' if n.action == 'plans' else ''}}>Показать тарифы</option><option value="url" {{'selected' if n.action == 'url' else ''}}>Открыть ссылку</option></select></div>
+<div class="form-row"><label>Текст сообщения</label><textarea name="text" maxlength="4000">{{n.text}}</textarea></div>
+<div class="form-row"><label>HTTPS-ссылка</label><input name="url" type="url" value="{{n.url}}" maxlength="500" placeholder="https://example.com"></div>
+<div class="form-row"><label>Порядок / активность</label><div class="toolbar"><input name="position" type="number" min="0" max="9999" value="{{n.position}}"><label><input class="check" type="checkbox" name="enabled" {{'checked' if n.enabled else ''}}> <span class="mini">Показывать кнопку</span></label></div></div>
+<div class="toolbar"><button>Сохранить</button></div></form><form method="post" action="/admin/botmenu/{{n.id}}/delete" onsubmit="return confirm('Удалить эту кнопку и всё вложенное меню?')"><button class="btn-danger">Удалить дерево</button></form>
+</details>{% else %}<div class="empty">Меню ещё не настроено</div>{% endfor %}
+</div></section>

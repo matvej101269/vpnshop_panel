@@ -20,6 +20,19 @@ class Plan(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class BotMenuNode(Base):
+    """Admin-authored Telegram menu tree; contains no subscriber data."""
+    __tablename__ = "bot_menu_nodes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    parent_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    label: Mapped[str] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(16), default="menu")
+    text: Mapped[str] = mapped_column(Text, default="")
+    url: Mapped[str] = mapped_column(String(500), default="")
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
 class PendingPayment(Base):
     """Temporary mapping needed to connect a payment webhook to a Telegram account."""
     __tablename__ = "pending_payments"
