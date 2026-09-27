@@ -47,6 +47,17 @@ class AddonPackage(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class AddonBalance(Base):
+    """Remaining one-time add-on traffic, tracked independently from plan quota."""
+    __tablename__ = "addon_balances"
+    telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    base_limit_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    remaining_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    consumed_cycle_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    last_usage_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    reset_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
 class PendingPayment(Base):
     """Temporary mapping needed to connect a payment webhook to a Telegram account."""
     __tablename__ = "pending_payments"

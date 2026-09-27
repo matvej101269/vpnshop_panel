@@ -6,7 +6,8 @@ from urllib.parse import quote
 import httpx
 from sqlalchemy import select
 from app.config import settings as env_settings
-from app.db import SessionLocal, Plan, AddonPackage, PendingPayment, Subscription, SubscriptionHistory, ProcessedPayment
+from app.db import (SessionLocal, Plan, AddonPackage, AddonBalance, PendingPayment, Subscription,
+                    SubscriptionHistory, ProcessedPayment)
 from app.runtime_config import get_config_map
 
 
@@ -217,7 +218,7 @@ class XUIClient:
                     continue
             return list(clients.values())
 
-    async def client_usage(self, sub_id: str, telegram_id: int | None = None) -> int:
+    async def client_usage_status(self, sub_id: str, telegram_id: int | None = None) -> dict:
         cfg = get_config_map()
         base = cfg["xui_base_url"].rstrip("/")
         api = base + "/" + cfg["xui_api_base_path"].strip("/")
@@ -238,7 +239,15 @@ class XUIClient:
                     response = await client.get(f"{api}/inbounds/getClientTraffics/{quote(legacy_email)}")
             response.raise_for_status()
             obj = response.json().get("obj") or {}
-            return int(obj.get("up", 0) or 0) + int(obj.get("down", 0) or 0)
+            reset_count = obj.get("resetCount")
+            if reset_count is None:
+                reset_count = obj.get("lastTrafficResetTime")
+            return {"used_bytes": int(obj.get("up", 0) or 0) + int(obj.get("down", 0) or 0),
+                    "reset_count": int(reset_count) if reset_count is not None else None}
+
+    async def client_usage(self, sub_id: str, telegram_id: int | None = None) -> int:
+        status = await self.client_usage_status(sub_id, telegram_id)
+        return status["used_bytes"]
 
     async def delete_client(self, sub_id: str, telegram_id: int | None = None):
         cfg = get_config_map()
@@ -338,6 +347,61 @@ def quote_immediate_switch(db, telegram_id: int, plan: Plan, now: datetime | Non
     return charge, credit, days
 
 
+def _advance_addon_balance(balance: AddonBalance, used_bytes: int, reset_count: int | None) -> None:
+    """Charge only usage above the plan quota to the purchased add-on balance."""
+    counter_reset = (reset_count is not None and balance.reset_count is not None
+                     and reset_count != balance.reset_count)
+    counter_reset = counter_reset or used_bytes < balance.last_usage_bytes
+    if counter_reset:
+        balance.remaining_bytes = max(0, balance.remaining_bytes - balance.consumed_cycle_bytes)
+        balance.consumed_cycle_bytes = 0
+    excess = max(0, used_bytes - balance.base_limit_bytes)
+    newly_consumed = max(0, excess - balance.consumed_cycle_bytes)
+    balance.remaining_bytes = max(0, balance.remaining_bytes - newly_consumed)
+    balance.consumed_cycle_bytes = excess
+    balance.last_usage_bytes = used_bytes
+    if reset_count is not None:
+        balance.reset_count = reset_count
+
+
+def _effective_traffic_limit(balance: AddonBalance) -> int:
+    # Once the one-time balance is spent, restore the plan cap. Since the
+    # counter is already above that cap, 3x-ui keeps the client depleted until
+    # its normal traffic reset or the next plan purchase.
+    if balance.remaining_bytes <= 0:
+        return balance.base_limit_bytes
+    return balance.base_limit_bytes + balance.consumed_cycle_bytes + balance.remaining_bytes
+
+
+async def reconcile_addon_balances() -> None:
+    """Track one-time package consumption and restore the plan cap when spent."""
+    with SessionLocal() as db:
+        telegram_ids = db.scalars(select(AddonBalance.telegram_id).where(AddonBalance.remaining_bytes > 0)).all()
+    for telegram_id in telegram_ids:
+        try:
+            with SessionLocal() as db:
+                balance = db.get(AddonBalance, telegram_id)
+                sub = db.get(Subscription, telegram_id)
+                if not balance or not sub:
+                    continue
+                status = await XUIClient().client_usage_status(sub.sub_id, telegram_id)
+                _advance_addon_balance(balance, status["used_bytes"], status["reset_count"])
+                effective_limit = _effective_traffic_limit(balance)
+                if effective_limit != sub.traffic_limit_bytes:
+                    inbound_ids = [int(value) for value in sub.inbound_ids.split(",") if value.isdigit()]
+                    await XUIClient().add_or_update_client(
+                        telegram_id, sub.sub_id, int(sub.expires_at.replace(tzinfo=timezone.utc).timestamp() * 1000),
+                        effective_limit, exists=True, limit_hwid=sub.limit_hwid,
+                        traffic_reset=sub.traffic_reset, inbound_ids=inbound_ids or None,
+                        enabled=sub.enabled, group_name=sub.plan_name)
+                    sub.traffic_limit_bytes = effective_limit
+                db.commit()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Traffic add-on reconciliation failed for Telegram ID %s: %s",
+                                                telegram_id, type(exc).__name__)
+
+
 async def provision_paid_invoice(invoice_id: str) -> tuple[int, str] | str | None:
     with SessionLocal() as db:
         invoice_hash = hashlib.sha256(invoice_id.encode()).hexdigest()
@@ -353,8 +417,30 @@ async def provision_paid_invoice(invoice_id: str) -> tuple[int, str] | str | Non
             if not package or not current:
                 return None
             addon_bytes = payment.package_traffic_bytes or int(package.traffic_gb * (1024 ** 3))
-            # Unlimited users stay unlimited; for limited users, extend the cap without resetting used traffic.
-            new_limit = 0 if current.traffic_limit_bytes == 0 else current.traffic_limit_bytes + addon_bytes
+            plan = db.get(Plan, current.plan_id) if current.plan_id else None
+            balance = db.get(AddonBalance, telegram_id)
+            base_limit = (balance.base_limit_bytes if balance and balance.base_limit_bytes > 0 else
+                          int(plan.traffic_limit_gb * (1024 ** 3)) if plan else current.traffic_limit_bytes)
+            if base_limit <= 0:
+                return None
+            status = await XUIClient().client_usage_status(current.sub_id, telegram_id)
+            if not balance:
+                balance = AddonBalance(telegram_id=telegram_id, base_limit_bytes=base_limit,
+                                       remaining_bytes=0,
+                                       consumed_cycle_bytes=max(0, status["used_bytes"] - base_limit),
+                                       last_usage_bytes=status["used_bytes"], reset_count=status["reset_count"])
+                db.add(balance)
+                db.flush()
+            else:
+                _advance_addon_balance(balance, status["used_bytes"], status["reset_count"])
+                if balance.base_limit_bytes != base_limit:
+                    balance.base_limit_bytes = base_limit
+                    balance.consumed_cycle_bytes = max(0, status["used_bytes"] - base_limit)
+            balance.remaining_bytes += addon_bytes
+            balance.last_usage_bytes = status["used_bytes"]
+            if status["reset_count"] is not None:
+                balance.reset_count = status["reset_count"]
+            new_limit = _effective_traffic_limit(balance)
             try:
                 inbound_ids = [int(value) for value in current.inbound_ids.split(",") if value.isdigit()]
             except ValueError:
@@ -388,6 +474,18 @@ async def provision_paid_invoice(invoice_id: str) -> tuple[int, str] | str | Non
         sub_id = current.sub_id if current else uuid.uuid4().hex[:20]
         plan_bytes = int(plan_traffic_gb * (1024 ** 3))
         new_traffic_limit = plan_bytes
+        balance = db.get(AddonBalance, telegram_id) if current else None
+        if balance and balance.remaining_bytes > 0 and plan_bytes > 0:
+            status = await XUIClient().client_usage_status(sub_id, telegram_id)
+            _advance_addon_balance(balance, status["used_bytes"], status["reset_count"])
+            balance.base_limit_bytes = plan_bytes
+            balance.consumed_cycle_bytes = max(0, status["used_bytes"] - plan_bytes)
+            balance.last_usage_bytes = status["used_bytes"]
+            if status["reset_count"] is not None:
+                balance.reset_count = status["reset_count"]
+            new_traffic_limit = _effective_traffic_limit(balance)
+        elif balance:
+            db.delete(balance)
         configured_inbounds = XUIClient._inbound_ids(get_config_map())
         await XUIClient().add_or_update_client(telegram_id, sub_id, int(expires.timestamp() * 1000),
                                                new_traffic_limit, exists=current is not None,

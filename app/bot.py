@@ -174,7 +174,7 @@ async def show_menu(target, parent_id: int | None):
                 back_keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
                 rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
                 keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
-                text = node.text or ("Выберите пакет дополнительного трафика:" if packages else
+                text = node.text or ("Выберите разовый пакет трафика. Он расходуется после квоты тарифа, а не увеличивает её навсегда." if packages else
                                      "Пакеты доступны только для подписок с ограниченным трафиком.")
             elif node.action == "offer":
                 text = node.text or "Ознакомьтесь с текстом оферты на странице по кнопке ниже."

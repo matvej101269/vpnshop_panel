@@ -21,9 +21,10 @@ from sqlalchemy import select, func
 from urllib.parse import unquote, urlsplit
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings as env_settings
-from app.db import (init_db, SessionLocal, Plan, AddonPackage, BotMenuNode, PendingPayment, FulfillmentJob, ProcessedPayment, Subscription,
+from app.db import (init_db, SessionLocal, Plan, AddonPackage, AddonBalance, BotMenuNode, PendingPayment, FulfillmentJob, ProcessedPayment, Subscription,
                     SubscriptionHistory, AdminAccount)
-from app.services import provision_paid_invoice, XUIClient, happ_link, upstream_happ_link
+from app.services import (provision_paid_invoice, reconcile_addon_balances, XUIClient,
+                          happ_link, upstream_happ_link)
 from app.backups import create_backup, backup_directory
 from app.bot import start_bot, notify_user, happ_bridge_url, routing_deep_link
 from app.runtime_config import (init_runtime_config, get_config, save_config, config_status,
@@ -156,7 +157,8 @@ async def process_payment_jobs():
                             from app.services import happ_link
                             link = happ_link(sub.sub_id)
             if product_type == "addon":
-                message = "Оплата подтверждена! Лимит дополнительного трафика добавлен к вашей подписке."
+                message = ("Оплата подтверждена! Разовый пакет трафика добавлен. Он расходуется после квоты тарифа; "
+                           "остаток пакета сохраняется при сбросе трафика.")
                 keyboard = None
             else:
                 bridge = happ_bridge_url(f"happ://add/{link}") if link else ""
@@ -257,6 +259,8 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(purge_old_pending_payments, "interval", hours=6, id="pending-retention", replace_existing=True)
     scheduler.add_job(process_payment_jobs, "interval", seconds=15, id="payment-fulfillment", replace_existing=True,
                       max_instances=1, coalesce=True)
+    scheduler.add_job(reconcile_addon_balances, "interval", seconds=60, id="traffic-addons",
+                      replace_existing=True, max_instances=1, coalesce=True)
     scheduler.add_job(create_backup, "interval", hours=24, id="daily-backup", replace_existing=True,
                       next_run_time=datetime.now(timezone.utc) + timedelta(minutes=1))
     scheduler.add_job(reconcile_subscriptions, "interval", hours=24, id="3xui-reconciliation", replace_existing=True,
@@ -967,6 +971,9 @@ async def edit_user(telegram_id: int, request: Request, _: None = Depends(admin)
         sub.expires_at = expires
         sub.enabled = form.get("enabled") == "on"
         sub.traffic_limit_bytes = int(float(form.get("traffic_limit_gb", 0)) * (1024 ** 3))
+        addon_balance = db.get(AddonBalance, telegram_id)
+        if addon_balance:
+            db.delete(addon_balance)
         sub.current_price = int(form.get("price", 0))
         await XUIClient().add_or_update_client(telegram_id, sub.sub_id, int(expires.timestamp() * 1000),
                                                sub.traffic_limit_bytes, exists=True, limit_hwid=sub.limit_hwid,
@@ -980,6 +987,9 @@ async def edit_user(telegram_id: int, request: Request, _: None = Depends(admin)
 async def remove_subscription(db, sub: Subscription):
     await XUIClient().delete_client(sub.sub_id, sub.telegram_id)
     db.query(SubscriptionHistory).filter(SubscriptionHistory.telegram_id == sub.telegram_id).delete(synchronize_session=False)
+    addon_balance = db.get(AddonBalance, sub.telegram_id)
+    if addon_balance:
+        db.delete(addon_balance)
     db.delete(sub)
 
 
