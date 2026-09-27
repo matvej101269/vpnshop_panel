@@ -381,12 +381,20 @@ window.setTimeout(()=>{{document.getElementById('status').textContent='Если 
 
 @app.get("/happ/sub/{sub_id}")
 async def happ_subscription_proxy(sub_id: str, request: Request):
-    """Proxy a single 3x-ui subscription and attach its Happ routing profile."""
+    """Proxy a 3x-ui subscription; attach routing only to an explicitly routed URL."""
     with SessionLocal() as db:
         sub = db.scalar(select(Subscription).where(Subscription.sub_id == sub_id))
         if not sub:
             raise HTTPException(status_code=404, detail="Подписка не найдена")
-        routing_rules = sub.routing_rules
+    routing_rules = ""
+    routing_token = request.query_params.get("routing", "")
+    if routing_token:
+        try:
+            routing_rules = decrypt_handoff(routing_token)
+            # Validate the signed payload before forwarding any value as a header.
+            json.loads(routing_rules)
+        except (ValueError, json.JSONDecodeError):
+            raise HTTPException(status_code=400, detail="Некорректный профиль маршрутизации")
     upstream_url = upstream_happ_link(sub_id)
     upstream = urlsplit(upstream_url)
     if upstream.scheme != "https" or not upstream.netloc:

@@ -206,11 +206,10 @@ async def show_menu(target, parent_id: int | None):
                 expires = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
                 active = bool(sub and sub.enabled and expires and expires > datetime.now(timezone.utc))
                 if active and node.routing_rules:
-                    # Persist only as subscription configuration, so the same
-                    # stable Happ URL can update the already-imported subscription.
-                    sub.routing_rules = node.routing_rules
-                    db.commit()
-                    link = happ_link(sub.sub_id)
+                    # A routed URL is created only after the user selects this
+                    # action. The regular subscription URL remains route-free.
+                    token = encrypt_handoff(node.routing_rules)
+                    link = f"{happ_link(sub.sub_id)}?routing={quote(token, safe='')}"
                     route_link = happ_bridge_url(f"happ://add/{link}") if link.startswith("https://") else ""
                 else:
                     route_link = ""
