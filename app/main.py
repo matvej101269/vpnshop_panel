@@ -15,7 +15,7 @@ from collections import Counter
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 import httpx
 from sqlalchemy import select, func
 from urllib.parse import unquote, urlsplit
@@ -163,7 +163,7 @@ async def process_payment_jobs():
                 message = ("Оплата подтверждена! Нажмите кнопку, чтобы открыть Happ и импортировать подписку."
                            if bridge else f"Оплата подтверждена! Добавьте ссылку в Happ:\n{link}" if link
                            else "Оплата подтверждена, подписка активирована.")
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть подписку в Happ", url=bridge)]]) if bridge else None
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть подписку в Happ", web_app=WebAppInfo(url=bridge))]]) if bridge else None
             await notify_user(int(telegram_id), message, reply_markup=keyboard)
             with SessionLocal() as db:
                 job = db.get(FulfillmentJob, invoice_id)
@@ -409,6 +409,11 @@ async def happ_subscription_proxy(sub_id: str, request: Request):
             forwarded[name] = upstream_response.headers[name]
     if routing_rules and upstream_response.is_success:
         forwarded["routing"] = unquote(routing_deep_link(routing_rules))
+        forwarded["X-Vpnshop-Routing-Attached"] = "1"
+    else:
+        forwarded["X-Vpnshop-Routing-Attached"] = "0"
+    logger.info("Happ subscription response served; status=%s routing_profile=%s",
+                upstream_response.status_code, "attached" if forwarded["X-Vpnshop-Routing-Attached"] == "1" else "none")
     return Response(content=upstream_response.content, status_code=upstream_response.status_code,
                     headers=forwarded)
 
