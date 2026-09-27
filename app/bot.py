@@ -9,7 +9,7 @@ from typing import AsyncGenerator, Optional
 from aiogram import Bot, Dispatcher, F
 from aiogram.dispatcher.dispatcher import DEFAULT_BACKOFF_CONFIG
 from aiogram.filters import CommandStart
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Update, WebAppInfo
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Update
 from aiogram.methods import GetUpdates
 from aiogram.exceptions import (TelegramNetworkError, TelegramServerError, TelegramUnauthorizedError,
                                 TelegramConflictError, TelegramBadRequest)
@@ -116,7 +116,7 @@ def menu_keyboard(db, parent_id: int | None, include_back: bool = True, telegram
             link = happ_link(sub.sub_id) if sub and sub.enabled and expiry and expiry > datetime.now(timezone.utc) else ""
             deep_link = happ_bridge_url(f"happ://add/{link}") if link.startswith(("http://", "https://")) else ""
             if deep_link and len(deep_link) <= 4096:
-                rows.append([InlineKeyboardButton(text=node.label, web_app=WebAppInfo(url=deep_link))])
+                rows.append([InlineKeyboardButton(text=node.label, url=deep_link)])
             else:
                 rows.append([InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}")])
         else:
@@ -191,7 +191,7 @@ async def show_menu(target, parent_id: int | None):
                 link = happ_link(sub.sub_id) if sub and sub.enabled and expires and expires > datetime.now(timezone.utc) else ""
                 if link.startswith(("http://", "https://")):
                     deep_link = happ_bridge_url(f"happ://add/{link}")
-                    rows = [[InlineKeyboardButton(text="Открыть подписку в Happ", web_app=WebAppInfo(url=deep_link))]] if deep_link and len(deep_link) <= 4096 else []
+                    rows = [[InlineKeyboardButton(text="Открыть подписку в Happ", url=deep_link)]] if deep_link and len(deep_link) <= 4096 else []
                     back_keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
                     rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
                     keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
@@ -214,7 +214,7 @@ async def show_menu(target, parent_id: int | None):
                     route_link = happ_bridge_url(f"happ://add/{link}") if link.startswith("https://") else ""
                 else:
                     route_link = ""
-                rows = [[InlineKeyboardButton(text="Применить правила к подписке в Happ", web_app=WebAppInfo(url=route_link))]] if route_link and len(route_link) <= 4096 else []
+                rows = [[InlineKeyboardButton(text="Применить правила к подписке в Happ", url=route_link)]] if route_link and len(route_link) <= 4096 else []
                 rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
                 keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
                 text = node.text or ("Профиль будет привязан к вашей подписке. Нажмите кнопку, чтобы обновить её в Happ." if route_link and len(route_link) <= 4096 else
@@ -301,7 +301,7 @@ async def create_plan_order(callback: CallbackQuery, immediate_switch: bool):
                 bridge = happ_bridge_url(f"happ://add/{result[1]}")
                 if bridge:
                     await callback.message.answer("Откройте новую подписку в Happ:", reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[[InlineKeyboardButton(text="Открыть подписку в Happ", web_app=WebAppInfo(url=bridge))]]))
+                        inline_keyboard=[[InlineKeyboardButton(text="Открыть подписку в Happ", url=bridge)]]))
                 else:
                     await callback.message.answer("Ссылка для Happ:\n" + result[1])
             await callback.answer()

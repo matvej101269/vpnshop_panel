@@ -15,7 +15,7 @@ from collections import Counter
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import httpx
 from sqlalchemy import select, func
 from urllib.parse import unquote, urlsplit
@@ -163,7 +163,7 @@ async def process_payment_jobs():
                 message = ("Оплата подтверждена! Нажмите кнопку, чтобы открыть Happ и импортировать подписку."
                            if bridge else f"Оплата подтверждена! Добавьте ссылку в Happ:\n{link}" if link
                            else "Оплата подтверждена, подписка активирована.")
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть подписку в Happ", web_app=WebAppInfo(url=bridge))]]) if bridge else None
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть подписку в Happ", url=bridge)]]) if bridge else None
             await notify_user(int(telegram_id), message, reply_markup=keyboard)
             with SessionLocal() as db:
                 job = db.get(FulfillmentJob, invoice_id)
