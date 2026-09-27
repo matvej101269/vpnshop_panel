@@ -15,9 +15,10 @@ class LavaClient:
         cfg = get_config_map()
         if not cfg["lava_api_key"] or not cfg["lava_offer_id"]:
             raise RuntimeError("Не настроены LAVA_API_KEY и LAVA_OFFER_ID")
-        # Lava's invoice API accepts an email field; use a random non-routable alias, not Telegram ID.
+        # Lava requires a syntactically valid email. Use a random placeholder, never Telegram ID
+        # or a customer's personal email; example.com is reserved for documentation/examples.
         payload = {"offerId": cfg["lava_offer_id"], "amount": plan.amount if amount is None else amount, "currency": plan.currency,
-                   "email": f"{uuid.uuid4().hex}@users.invalid"}
+                   "email": f"{uuid.uuid4().hex}@example.com"}
         if cfg["lava_payment_provider"]:
             payload["paymentProvider"] = cfg["lava_payment_provider"]
         async with httpx.AsyncClient(timeout=20) as client:
@@ -293,8 +294,10 @@ class XUIClient:
 
 def happ_link(sub_id: str) -> str:
     cfg = get_config_map()
-    base, path = cfg["happ_subscription_base"].rstrip("/"), cfg["happ_subscription_path"].strip("/")
-    return f"{base}/{path}/{quote(sub_id)}"
+    # Happ subscription URLs end with the subscription ID directly; adding a
+    # configurable `/sub` segment breaks the panel's subscription endpoint.
+    base = cfg["happ_subscription_base"].rstrip("/")
+    return f"{base}/{quote(sub_id)}"
 
 
 def quote_immediate_switch(db, telegram_id: int, plan: Plan, now: datetime | None = None) -> tuple[int, int, int]:

@@ -36,7 +36,6 @@ CONFIG_DEFAULTS = {
     "xui_inbound_id": str(env_settings.xui_inbound_id),
     "xui_inbound_ids": str(env_settings.xui_inbound_id),
     "happ_subscription_base": env_settings.happ_subscription_base,
-    "happ_subscription_path": "/sub",
     "reminder_days": env_settings.reminder_days,
     "timezone": env_settings.timezone,
     "bot_welcome_text": "Выберите период VPN-подписки:",
