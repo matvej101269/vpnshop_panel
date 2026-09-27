@@ -1,4 +1,8 @@
 import asyncio
+import base64
+import binascii
+import json
+import re
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -7,9 +11,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from collections import Counter
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, func
+from urllib.parse import unquote
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings as env_settings
 from app.db import (init_db, SessionLocal, Plan, AddonPackage, BotMenuNode, PendingPayment, Subscription,
@@ -18,10 +22,10 @@ from app.services import provision_paid_invoice, XUIClient
 from app.bot import start_bot, notify_user
 from app.runtime_config import (init_runtime_config, get_config, save_config, config_status,
                                 verify_admin, save_admin_account, CONFIG_DEFAULTS, SECRET_KEYS,
-                                make_csrf_token, verify_csrf_token, get_config_map)
+                                make_csrf_token, verify_csrf_token, get_config_map,
+                                create_admin_session, verify_admin_session)
 
 templates = Jinja2Templates(directory="app/templates")
-security = HTTPBasic()
 scheduler = AsyncIOScheduler(timezone=env_settings.timezone)
 bot_task: asyncio.Task | None = None
 SECTIONS = {"overview", "users", "subscriptions", "addons", "history", "settings", "botmenu"}
@@ -32,10 +36,11 @@ SECRET_LABELS = {
 }
 
 
-def admin(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
-    if not verify_admin(credentials.username, credentials.password):
-        raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Basic"})
-    request.state.admin_username = credentials.username
+def admin(request: Request):
+    username = verify_admin_session(request.cookies.get("vpnshop_admin", ""))
+    if not username:
+        raise HTTPException(status_code=303, headers={"Location": "/login"})
+    request.state.admin_username = username
 
 
 async def checked_form(request: Request):
@@ -114,10 +119,56 @@ app = FastAPI(title="VPN Shop", lifespan=lifespan)
 
 @app.middleware("http")
 async def disable_admin_caching(request: Request, call_next):
+    configured_prefix = "/" + (get_config("panel_uri_path").strip("/") or "admin")
+    original_path = request.scope.get("path", "")
+    if configured_prefix != "/admin" and (original_path == configured_prefix or original_path.startswith(configured_prefix + "/")):
+        suffix = original_path[len(configured_prefix):]
+        mapped_path = "/admin" + suffix
+        request.scope["path"] = mapped_path
+        request.scope["raw_path"] = mapped_path.encode("utf-8")
     response = await call_next(request)
-    if request.url.path.startswith("/admin"):
+    if original_path.startswith("/admin") or original_path == configured_prefix or original_path.startswith(configured_prefix + "/"):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         response.headers["Pragma"] = "no-cache"
+    if configured_prefix != "/admin" and response.headers.get("content-type", "").startswith("text/html"):
+        chunks = [chunk async for chunk in response.body_iterator]
+        body = b"".join(chunks).replace(b"/admin", configured_prefix.encode("utf-8"))
+        async def rewritten_body():
+            yield body
+        response.body_iterator = rewritten_body()
+        response.headers["content-length"] = str(len(body))
+    location = response.headers.get("location", "")
+    if configured_prefix != "/admin" and (location == "/admin" or location.startswith("/admin/")):
+        response.headers["location"] = configured_prefix + location[len("/admin"):]
+    return response
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    return templates.TemplateResponse(request, "login.html", {"error": ""})
+
+
+@app.post("/login", response_class=HTMLResponse)
+async def login_submit(request: Request):
+    form = await request.form()
+    username = str(form.get("username", ""))
+    password = str(form.get("password", ""))
+    if not verify_admin(username, password):
+        return templates.TemplateResponse(request, "login.html", {
+            "error": "Неверный логин или пароль"}, status_code=401)
+    response = RedirectResponse("/" + (get_config("panel_uri_path").strip("/") or "admin"), status_code=303)
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    response.set_cookie("vpnshop_admin", create_admin_session(username), max_age=12 * 60 * 60,
+                        httponly=True, secure=request.url.scheme == "https" or forwarded_proto == "https",
+                        samesite="strict", path="/")
+    return response
+
+
+@app.post("/logout")
+async def logout(request: Request, _: None = Depends(admin)):
+    await checked_form(request)
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie("vpnshop_admin", path="/")
     return response
 
 
@@ -257,10 +308,11 @@ def validate_menu_values(form, db, current_id: int | None = None):
     action = str(form.get("action", "menu")).strip()
     text_value = str(form.get("text", "")).strip()
     url = str(form.get("url", "")).strip()
+    routing_rules = str(form.get("routing_rules", "")).strip()
     parent_raw = str(form.get("parent_id", "")).strip()
     if not label or len(label) > 64:
         raise HTTPException(status_code=400, detail="Название кнопки должно быть от 1 до 64 символов")
-    if action not in {"menu", "plans", "change_plan", "subscription_info", "addons", "offer", "url"}:
+    if action not in {"menu", "plans", "change_plan", "subscription_info", "addons", "offer", "url", "open_happ", "routing"}:
         raise HTTPException(status_code=400, detail="Неизвестное действие кнопки")
     parent_id = int(parent_raw) if parent_raw.isdigit() and int(parent_raw) > 0 else None
     if parent_id is not None:
@@ -280,13 +332,36 @@ def validate_menu_values(form, db, current_id: int | None = None):
             raise HTTPException(status_code=400, detail="Для ссылки кнопки укажите корректный HTTPS URL")
     elif url:
         raise HTTPException(status_code=400, detail="URL используется только для действия «Открыть ссылку»")
+    if action == "routing":
+        if not routing_rules:
+            raise HTTPException(status_code=400, detail="Укажите JSON правил или готовую ссылку happ://routing/add/…")
+        try:
+            prefix = "happ://routing/add/"
+            if routing_rules.startswith(prefix):
+                encoded = unquote(routing_rules[len(prefix):]).strip()
+                decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+                rules_object = json.loads(decoded.decode("utf-8"))
+                normalized_rules = routing_rules
+            else:
+                rules_object = json.loads(routing_rules)
+                normalized_rules = json.dumps(rules_object, ensure_ascii=False, separators=(",", ":"))
+            if not isinstance(rules_object, dict):
+                raise ValueError("Routing profile must be a JSON object")
+            if len(normalized_rules.encode("utf-8")) > 16000:
+                raise ValueError("Routing profile is too large")
+            routing_rules = normalized_rules
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError, binascii.Error) as exc:
+            raise HTTPException(status_code=400, detail="Укажите корректный JSON-объект или ссылку Happ с Base64 JSON") from exc
+    else:
+        routing_rules = ""
     position_raw = str(form.get("position", "0")).strip()
     try:
         position = max(0, min(9999, int(position_raw or 0)))
     except ValueError:
         raise HTTPException(status_code=400, detail="Порядок должен быть целым числом")
     return {"parent_id": parent_id, "label": label, "action": action,
-            "text": text_value[:4000], "url": url, "position": position,
+            "text": text_value[:4000], "url": url, "routing_rules": routing_rules,
+            "position": position,
             "enabled": str(form.get("enabled", "")) == "on"}
 
 
@@ -478,7 +553,8 @@ async def create_user(request: Request, _: None = Depends(admin)):
         inbounds = XUIClient._inbound_ids(get_config_map())
         await XUIClient().add_or_update_client(telegram_id, sub_id, int(expires.timestamp() * 1000), traffic_bytes,
                                                exists=False, limit_hwid=plan.limit_hwid,
-                                               traffic_reset=plan.traffic_reset, inbound_ids=inbounds)
+                                               traffic_reset=plan.traffic_reset, inbound_ids=inbounds,
+                                               group_name=plan.name)
         db.add(Subscription(telegram_id=telegram_id, sub_id=sub_id, expires_at=expires, plan_id=plan.id, plan_name=title,
                             current_price=price, currency=currency, traffic_limit_bytes=traffic_bytes, enabled=True,
                             limit_hwid=plan.limit_hwid, traffic_reset=plan.traffic_reset,
@@ -511,7 +587,7 @@ async def edit_user(telegram_id: int, request: Request, _: None = Depends(admin)
                                                sub.traffic_limit_bytes, exists=True, limit_hwid=sub.limit_hwid,
                                                traffic_reset=sub.traffic_reset,
                                                inbound_ids=[int(v) for v in sub.inbound_ids.split(",") if v.isdigit()] or None,
-                                               enabled=sub.enabled)
+                                               enabled=sub.enabled, group_name=sub.plan_name)
         db.commit()
     return RedirectResponse("/admin/users", status_code=303)
 
@@ -551,6 +627,24 @@ async def update_settings(request: Request, _: None = Depends(admin)):
     form = await checked_form(request)
     allowed_plain = set(CONFIG_DEFAULTS) - SECRET_KEYS
     values = {key: str(form.get(key, "")).strip() for key in allowed_plain if key in form}
+    scheme = str(form.get("panel_scheme", "https")).strip().lower()
+    domain = str(form.get("panel_domain", "")).strip()
+    try:
+        panel_port = int(str(form.get("panel_port", "")).strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Порт панели должен быть числом от 1 до 65535") from exc
+    uri_path = str(form.get("panel_uri_path", "admin")).strip().strip("/")
+    if scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="Протокол панели должен быть HTTP или HTTPS")
+    if not domain or any(char in domain for char in "/\\?#:@ "):
+        raise HTTPException(status_code=400, detail="Укажите домен или IP без протокола и пути")
+    if not 1 <= panel_port <= 65535:
+        raise HTTPException(status_code=400, detail="Порт панели должен быть от 1 до 65535")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", uri_path):
+        raise HTTPException(status_code=400, detail="URI-путь: только латинские буквы, цифры, дефис, подчёркивание и /")
+    origin_port = "" if (scheme, panel_port) in {("http", 80), ("https", 443)} else f":{panel_port}"
+    values.update(panel_scheme=scheme, panel_domain=domain, panel_port=str(panel_port), panel_uri_path=uri_path,
+                  public_base_url=f"{scheme}://{domain}{origin_port}")
     inbound_ids = sorted({int(value) for value in str(form.get("xui_inbound_ids", "")).split(",")
                           if value.strip().isdigit() and int(value) > 0})
     if not inbound_ids:

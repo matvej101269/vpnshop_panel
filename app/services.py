@@ -46,7 +46,8 @@ class XUIClient:
 
     async def add_or_update_client(self, telegram_id: int, sub_id: str, expiry_ms: int, traffic_limit_bytes: int,
                                    exists: bool, limit_hwid: int = 0, traffic_reset: str = "never",
-                                   inbound_ids: list[int] | None = None, enabled: bool = True):
+                                   inbound_ids: list[int] | None = None, enabled: bool = True,
+                                   group_name: str = ""):
         cfg = get_config_map()
         if not cfg["xui_base_url"] or (not cfg["xui_api_token"] and not all((cfg["xui_username"], cfg["xui_password"]))):
             raise RuntimeError("Не настроено подключение к 3x-ui")
@@ -60,10 +61,12 @@ class XUIClient:
                        "limitIp": 0, "limitHwid": max(0, int(limit_hwid)),
                        # 3x-ui's totalGB field is stored in bytes (despite its name).
                        "totalGB": max(0, int(traffic_limit_bytes)), "trafficReset": traffic_reset,
-                       "trafficResetDay": 1, "subId": sub_id, "tgId": 0}
+                       "trafficResetDay": 1, "subId": sub_id, "tgId": 0, "group": group_name}
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             if cfg["xui_api_token"]:
                 headers = {"Authorization": f"Bearer {cfg['xui_api_token']}"}
+                if group_name:
+                    await self.ensure_group(client, api, group_name, headers)
                 if exists:
                     response = await client.post(f"{api}/clients/update/{quote(client_email)}", json=client_data, headers=headers)
                     if response.status_code == 404:
@@ -74,6 +77,8 @@ class XUIClient:
             else:
                 login = await client.post(f"{base}/{cfg['xui_login_path'].lstrip('/')}", data={"username": cfg["xui_username"], "password": cfg["xui_password"]})
                 login.raise_for_status()
+                if group_name:
+                    await self.ensure_group(client, api, group_name, {})
                 body = client_data
                 if exists:
                     for inbound_id in targets:
@@ -99,6 +104,27 @@ class XUIClient:
             result = response.json()
             if result.get("success") is False:
                 raise RuntimeError(f"3x-ui error: {result.get('msg', 'unknown error')}")
+
+    @staticmethod
+    async def ensure_group(client: httpx.AsyncClient, api: str, group_name: str, headers: dict):
+        response = await client.get(f"{api}/clients/groups", headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("success") is False:
+            raise RuntimeError(f"3x-ui groups error: {data.get('msg') or 'cannot load groups'}")
+        groups = data.get("obj") or []
+        if any((item.get("name") if isinstance(item, dict) else str(item)) == group_name for item in groups):
+            return
+        created = await client.post(f"{api}/clients/groups/create", json={"name": group_name}, headers=headers)
+        created.raise_for_status()
+        result = created.json()
+        if result.get("success") is False:
+            # Another payment may have created this group between the list and create requests.
+            refreshed = await client.get(f"{api}/clients/groups", headers=headers)
+            refreshed.raise_for_status()
+            current = refreshed.json().get("obj") or []
+            if not any((item.get("name") if isinstance(item, dict) else str(item)) == group_name for item in current):
+                raise RuntimeError(f"3x-ui could not create client group: {result.get('msg') or 'unknown error'}")
 
     async def list_inbounds(self) -> list[dict]:
         cfg = get_config_map()
@@ -226,7 +252,7 @@ async def provision_paid_invoice(invoice_id: str) -> tuple[int, str] | str | Non
             await XUIClient().add_or_update_client(
                 telegram_id, current.sub_id, int(current.expires_at.replace(tzinfo=timezone.utc).timestamp() * 1000),
                 new_limit, exists=True, limit_hwid=current.limit_hwid, traffic_reset=current.traffic_reset,
-                inbound_ids=inbound_ids or None, enabled=current.enabled)
+                inbound_ids=inbound_ids or None, enabled=current.enabled, group_name=current.plan_name)
             current.traffic_limit_bytes = new_limit
             db.add(ProcessedPayment(payment_hash=invoice_hash))
             db.delete(payment)
@@ -246,7 +272,7 @@ async def provision_paid_invoice(invoice_id: str) -> tuple[int, str] | str | Non
         await XUIClient().add_or_update_client(telegram_id, sub_id, int(expires.timestamp() * 1000),
                                                new_traffic_limit, exists=current is not None,
                                                limit_hwid=plan.limit_hwid, traffic_reset=plan.traffic_reset,
-                                               inbound_ids=configured_inbounds)
+                                               inbound_ids=configured_inbounds, group_name=plan.name)
         if current:
             await XUIClient().reset_client_traffic(sub_id, telegram_id)
         if current:

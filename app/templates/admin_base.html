@@ -16,7 +16,7 @@
 <a class="{{ 'active' if section=='botmenu' else '' }}" href="/admin/botmenu"><span class="ico">☷</span><span>Конструктор бота</span></a>
 <a class="{{ 'active' if section=='settings' else '' }}" href="/admin/settings"><span class="ico">⚙</span><span>Настройки</span></a>
 </nav><div class="side-foot">VPN service · Admin</div></aside>
-<main class="main"><header class="top"><div class="crumb">VPN Panel <span class="muted">/ {{ section }}</span></div><div class="admin-chip">● &nbsp;Администратор</div></header>
+<main class="main"><header class="top"><div class="crumb">VPN Panel <span class="muted">/ {{ section }}</span></div><form method="post" action="/logout" style="display:flex;align-items:center;gap:8px;margin:0"><div class="admin-chip">● &nbsp;Администратор</div><button type="submit" class="btn-quiet">Выйти</button></form></header>
 <div class="content">{% include section_body %}<footer>VPN service · панель управления</footer></div></main></div>
 <script>
 document.querySelectorAll('th[data-sort]').forEach(th=>th.addEventListener('click',()=>{const table=th.closest('table'),idx=[...th.parentElement.children].indexOf(th),body=table.tBodies[0],rows=[...body.rows],asc=th.dataset.order!=='asc';rows.sort((a,b)=>{const x=a.cells[idx]?.dataset.sort??a.cells[idx]?.innerText??'',y=b.cells[idx]?.dataset.sort??b.cells[idx]?.innerText??'';const nx=Number(x),ny=Number(y);return (Number.isNaN(nx)?x.localeCompare(y,'ru'):nx-ny)*(asc?1:-1)});rows.forEach(r=>body.appendChild(r));th.dataset.order=asc?'asc':'desc'}));

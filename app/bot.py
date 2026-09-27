@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import ipaddress
+import json
 import logging
 from datetime import datetime, timezone
 from typing import AsyncGenerator, Optional
@@ -11,10 +13,10 @@ from aiogram.methods import GetUpdates
 from aiogram.exceptions import (TelegramNetworkError, TelegramServerError, TelegramUnauthorizedError,
                                 TelegramConflictError, TelegramBadRequest)
 from aiogram.utils.backoff import Backoff, BackoffConfig
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from sqlalchemy import select
 from app.db import SessionLocal, Plan, AddonPackage, PendingPayment, BotMenuNode, Subscription
-from app.services import LavaClient, XUIClient
+from app.services import LavaClient, XUIClient, happ_link
 from app.runtime_config import get_config
 
 logger = logging.getLogger(__name__)
@@ -70,7 +72,16 @@ def is_public_http_url(value: str) -> bool:
     return not (address.is_private or address.is_loopback or address.is_link_local or address.is_unspecified)
 
 
-def menu_keyboard(db, parent_id: int | None, include_back: bool = True):
+def routing_deep_link(rules: str) -> str:
+    prefix = "happ://routing/add/"
+    if rules.startswith(prefix):
+        return rules
+    compact = json.dumps(json.loads(rules), ensure_ascii=False, separators=(",", ":"))
+    encoded = base64.b64encode(compact.encode("utf-8")).decode("ascii")
+    return prefix + quote(encoded, safe="")
+
+
+def menu_keyboard(db, parent_id: int | None, include_back: bool = True, telegram_id: int | None = None):
     nodes = db.scalars(select(BotMenuNode).where(
         BotMenuNode.parent_id == parent_id, BotMenuNode.enabled.is_(True)
     ).order_by(BotMenuNode.position, BotMenuNode.id)).all()
@@ -78,6 +89,21 @@ def menu_keyboard(db, parent_id: int | None, include_back: bool = True):
     for node in nodes:
         if node.action == "url":
             rows.append([InlineKeyboardButton(text=node.label, url=node.url)])
+        elif node.action == "routing" and node.routing_rules:
+            link = routing_deep_link(node.routing_rules)
+            if len(link) <= 4096:
+                rows.append([InlineKeyboardButton(text=node.label, url=link)])
+            else:
+                rows.append([InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}")])
+        elif node.action == "open_happ" and telegram_id is not None:
+            sub = db.get(Subscription, telegram_id)
+            expiry = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
+            link = happ_link(sub.sub_id) if sub and sub.enabled and expiry and expiry > datetime.now(timezone.utc) else ""
+            deep_link = f"happ://add/{link}" if link.startswith(("http://", "https://")) else ""
+            if deep_link and len(deep_link) <= 4096:
+                rows.append([InlineKeyboardButton(text=node.label, url=deep_link)])
+            else:
+                rows.append([InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}")])
         else:
             rows.append([InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}")])
     if include_back and parent_id is not None:
@@ -88,10 +114,11 @@ def menu_keyboard(db, parent_id: int | None, include_back: bool = True):
 
 
 async def show_menu(target, parent_id: int | None):
+    telegram_id = target.from_user.id
     with SessionLocal() as db:
         if parent_id is None:
             text = get_config("bot_welcome_text")
-            keyboard = menu_keyboard(db, None, include_back=False)
+            keyboard = menu_keyboard(db, None, include_back=False, telegram_id=telegram_id)
         else:
             node = db.get(BotMenuNode, parent_id)
             if not node or not node.enabled:
@@ -109,7 +136,7 @@ async def show_menu(target, parent_id: int | None):
                 sub = db.get(Subscription, target.from_user.id)
                 if not sub:
                     text = "У вас пока нет активной подписки."
-                    keyboard = menu_keyboard(db, node.id)
+                    keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
                 else:
                     try:
                         used = await XUIClient().client_usage(sub.sub_id, sub.telegram_id)
@@ -121,14 +148,14 @@ async def show_menu(target, parent_id: int | None):
                              f"Использовано {used / (1024 ** 3):.2f} ГБ · без ограничений" if used is not None else
                              "Не удалось получить данные из 3x-ui")
                     text = f"Подписка: {sub.plan_name or 'VPN'}\nДействует до: {until}\nТрафик: {usage}"
-                    keyboard = menu_keyboard(db, node.id)
+                    keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
             elif node.action == "addons":
                 sub = db.get(Subscription, target.from_user.id)
                 expires = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
                 packages = db.scalars(select(AddonPackage).where(AddonPackage.enabled.is_(True))).all() if sub and sub.enabled and sub.traffic_limit_bytes and expires and expires > datetime.now(timezone.utc) else []
                 rows = [[InlineKeyboardButton(text=f"{pkg.name} · {pkg.traffic_gb:g} ГБ — {pkg.amount} {pkg.currency}",
                                               callback_data=f"addon:{pkg.id}")] for pkg in packages]
-                back_keyboard = menu_keyboard(db, node.id)
+                back_keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
                 rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
                 keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
                 text = node.text or ("Выберите пакет дополнительного трафика:" if packages else
@@ -139,11 +166,34 @@ async def show_menu(target, parent_id: int | None):
                 base = get_config("public_base_url").rstrip("/")
                 if is_public_http_url(base):
                     rows.append([InlineKeyboardButton(text="Открыть оферту", url=f"{base}/offer")])
-                back_keyboard = menu_keyboard(db, node.id)
+                back_keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
                 rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
                 keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+            elif node.action == "open_happ":
+                sub = db.get(Subscription, telegram_id)
+                expires = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
+                link = happ_link(sub.sub_id) if sub and sub.enabled and expires and expires > datetime.now(timezone.utc) else ""
+                if link.startswith(("http://", "https://")):
+                    deep_link = f"happ://add/{link}"
+                    rows = [[InlineKeyboardButton(text="Открыть подписку в Happ", url=deep_link)]] if len(deep_link) <= 4096 else []
+                    back_keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
+                    rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+                    text = node.text or ("Нажмите кнопку, чтобы открыть Happ и добавить подписку." if rows else
+                                         "Ссылка подписки слишком длинная для кнопки Happ.")
+                else:
+                    text = node.text or "Активная подписка не найдена или не настроен URL подписки Happ."
+                    keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
+            elif node.action == "routing":
+                back_keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
+                route_link = routing_deep_link(node.routing_rules) if node.routing_rules else ""
+                rows = [[InlineKeyboardButton(text="Добавить правила в Happ", url=route_link)]] if route_link and len(route_link) <= 4096 else []
+                rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
+                keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+                text = node.text or ("Нажмите кнопку, чтобы добавить профиль маршрутизации в Happ." if route_link and len(route_link) <= 4096 else
+                                     "Профиль маршрутизации слишком большой или не настроен.")
             else:
-                keyboard = menu_keyboard(db, node.id)
+                keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
         if parent_id is None and not keyboard:
             plans = db.scalars(select(Plan).where(Plan.enabled.is_(True), Plan.show_in_bot.is_(True))).all()
             rows = [[InlineKeyboardButton(text=f"{p.name} — {p.amount} {p.currency}", callback_data=f"buy:{p.id}")]

@@ -32,6 +32,7 @@ class BotMenuNode(Base):
     action: Mapped[str] = mapped_column(String(16), default="menu")
     text: Mapped[str] = mapped_column(Text, default="")
     url: Mapped[str] = mapped_column(String(500), default="")
+    routing_rules: Mapped[str] = mapped_column(Text, default="")
     position: Mapped[int] = mapped_column(Integer, default=0)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -141,6 +142,7 @@ def init_db():
     # Small in-place SQLite schema upgrade for databases created by earlier app revisions.
     if settings.database_url.startswith("sqlite"):
         upgrades = {
+            "bot_menu_nodes": {"routing_rules": "TEXT NOT NULL DEFAULT ''"},
             "plans": {"traffic_limit_gb": "FLOAT NOT NULL DEFAULT 0",
                       "show_in_bot": "BOOLEAN NOT NULL DEFAULT 1",
                       "limit_hwid": "INTEGER NOT NULL DEFAULT 0",

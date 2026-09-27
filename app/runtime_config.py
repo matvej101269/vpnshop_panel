@@ -1,11 +1,13 @@
 """Encrypted admin-managed configuration; secret values never leave this module."""
 import base64
+import binascii
 import hashlib
 import hmac
 import os
 import secrets
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select
 from app.config import settings as env_settings
@@ -15,6 +17,10 @@ from app.db import SessionLocal, AppSetting, AdminAccount
 CONFIG_DEFAULTS = {
     "bot_token": env_settings.bot_token,
     "public_base_url": env_settings.public_base_url,
+    "panel_scheme": "http",
+    "panel_domain": "localhost",
+    "panel_port": "8000",
+    "panel_uri_path": "admin",
     "lava_api_key": env_settings.lava_api_key,
     "lava_api_url": "https://gate.lava.top",
     "lava_invoice_path": "/api/v3/invoice",
@@ -87,6 +93,31 @@ def verify_csrf_token(username: str, token: str) -> bool:
         return hmac.compare_digest(signature, expected)
     except (ValueError, OSError):
         return False
+
+
+def create_admin_session(username: str, lifetime_seconds: int = 12 * 60 * 60) -> str:
+    expires = int(time.time()) + lifetime_seconds
+    payload = f"{username}\n{expires}".encode()
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    key = base64.urlsafe_b64decode(_key_path().read_bytes().strip())
+    signature = hmac.new(key, payload, hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def verify_admin_session(token: str) -> str | None:
+    try:
+        encoded, signature = token.split(".", 1)
+        payload = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        key = base64.urlsafe_b64decode(_key_path().read_bytes().strip())
+        expected = hmac.new(key, payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        username, expires = payload.decode().rsplit("\n", 1)
+        if int(expires) < int(time.time()):
+            return None
+        return username or None
+    except (ValueError, UnicodeDecodeError, OSError, binascii.Error):
+        return None
 
 
 def _encode(key: str, value: str) -> str:
@@ -190,8 +221,20 @@ def save_admin_account(username: str, password: str = ""):
 def init_runtime_config():
     # Import environment values only at first boot; subsequent edits live in the admin DB.
     with SessionLocal() as db:
+        initial_values = dict(CONFIG_DEFAULTS)
+        # Preserve an already configured public origin when adding the panel address fields.
+        public_setting = db.get(AppSetting, "public_base_url")
+        public_origin = public_setting.value if public_setting and public_setting.value else env_settings.public_base_url
+        parsed = urlsplit(public_origin)
+        if parsed.hostname:
+            initial_values.update(
+                panel_scheme=parsed.scheme if parsed.scheme in {"http", "https"} else "https",
+                panel_domain=parsed.hostname,
+                panel_port=str(parsed.port or (443 if parsed.scheme == "https" else 80)),
+            )
         for key, value in CONFIG_DEFAULTS.items():
             if db.get(AppSetting, key) is None:
+                value = initial_values.get(key, value)
                 db.add(AppSetting(key=key, value=_encode(key, str(value)), is_secret=key in SECRET_KEYS,
                                   label=DEFAULT_LABELS.get(key, key)))
         if not db.scalars(select(AdminAccount)).first():
