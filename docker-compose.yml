@@ -1,13 +1,66 @@
+x-vpnshop-app: &vpnshop-app
+  build: .
+  env_file: .env
+  environment: &vpnshop-environment
+    DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://vpnshop:localdev@db:5432/vpnshop}
+    CONTROL_API_URL: http://vpnshop-control:8765
+    CONTROL_API_TOKEN: ${CONTROL_TOKEN:-}
+    DB_POOL_SIZE: ${DB_POOL_SIZE:-3}
+    DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-2}
+    WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-1}
+    WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+  restart: unless-stopped
+  volumes:
+    - vpnshop-data:/app/data
+  depends_on:
+    vpnshop-init:
+      condition: service_completed_successfully
+  logging:
+    driver: local
+    options:
+      max-size: 10m
+      max-file: "5"
+
 services:
-  vpnshop:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: vpnshop
+      POSTGRES_USER: vpnshop
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localdev}
+    volumes:
+      - vpnshop-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vpnshop -d vpnshop"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  vpnshop-init:
     build: .
     env_file: .env
     environment:
-      CONTROL_API_URL: http://vpnshop-control:8765
-      CONTROL_API_TOKEN: ${CONTROL_TOKEN:-}
-    restart: unless-stopped
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://vpnshop:localdev@db:5432/vpnshop}
+    command: ["python", "-m", "app.initdb"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
     volumes:
       - vpnshop-data:/app/data
+
+  vpnshop:
+    <<: *vpnshop-app
+    environment:
+      <<: *vpnshop-environment
+      APP_ROLE: web
+    command: ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers $${WEB_WORKERS:-2}"]
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:
@@ -16,11 +69,28 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
-    logging:
-      driver: local
-      options:
-        max-size: "10m"
-        max-file: "5"
+
+  vpnshop-bot:
+    <<: *vpnshop-app
+    environment:
+      <<: *vpnshop-environment
+      APP_ROLE: bot
+    command: ["python", "-m", "app.bot_runner"]
+
+  vpnshop-worker:
+    <<: *vpnshop-app
+    environment:
+      <<: *vpnshop-environment
+      APP_ROLE: worker
+    command: ["python", "-m", "app.worker"]
+
+  vpnshop-scheduler:
+    <<: *vpnshop-app
+    environment:
+      <<: *vpnshop-environment
+      APP_ROLE: scheduler
+    command: ["python", "-m", "app.scheduler_runner"]
+
   vpnshop-control:
     build: ./ops-control
     environment:
@@ -40,8 +110,10 @@ services:
     logging:
       driver: local
       options:
-        max-size: "5m"
+        max-size: 5m
         max-file: "3"
     restart: unless-stopped
+
 volumes:
   vpnshop-data:
+  vpnshop-db-data:

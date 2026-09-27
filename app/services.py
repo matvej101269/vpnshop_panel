@@ -215,6 +215,17 @@ class XUIClient:
                             continue
                         entry = clients.setdefault(email, dict(item, inboundIds=[]))
                         entry["inboundIds"].append(inbound_id)
+                    for stat in inbound.get("clientStats") or []:
+                        email = str(stat.get("email", ""))
+                        if not email:
+                            continue
+                        entry = clients.setdefault(email, dict(stat, inboundIds=[]))
+                        entry["used_bytes"] = int(entry.get("used_bytes", 0) or 0) + int(stat.get("up", 0) or 0) + int(stat.get("down", 0) or 0)
+                        entry["up"] = int(entry.get("up", 0) or 0) + int(stat.get("up", 0) or 0)
+                        entry["down"] = int(entry.get("down", 0) or 0) + int(stat.get("down", 0) or 0)
+                        for key in ("total", "expiryTime", "enable", "reset", "lastOnline"):
+                            if key in stat and (key not in entry or entry[key] in (None, "", 0)):
+                                entry[key] = stat[key]
                 except (ValueError, TypeError, json.JSONDecodeError):
                     continue
             return list(clients.values())

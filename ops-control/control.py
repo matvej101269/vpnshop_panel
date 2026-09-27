@@ -10,6 +10,8 @@ from urllib.parse import parse_qs, urlsplit
 TOKEN = os.environ.get("CONTROL_TOKEN", "")
 PROJECT_DIR = os.environ.get("PROJECT_DIR", "/opt/vpnshop")
 COMPOSE = ["docker", "compose", "--project-directory", PROJECT_DIR, "-f", os.path.join(PROJECT_DIR, "docker-compose.yml")]
+APP_SERVICES = ["vpnshop-init", "vpnshop", "vpnshop-bot", "vpnshop-worker", "vpnshop-scheduler"]
+RUNTIME_SERVICES = APP_SERVICES[1:]
 STATE = {"operation": "", "status": "idle", "message": ""}
 STATE_LOCK = threading.Lock()
 
@@ -20,7 +22,7 @@ def run_operation(operation):
     try:
         time.sleep(1)
         if operation == "restart":
-            output = subprocess.run(COMPOSE + ["restart", "vpnshop"], cwd=PROJECT_DIR,
+            output = subprocess.run(COMPOSE + ["restart", *RUNTIME_SERVICES], cwd=PROJECT_DIR,
                                     capture_output=True, text=True, timeout=90, check=False)
             print("restart: " + (output.stdout + output.stderr).strip(), flush=True)
             if output.returncode:
@@ -36,36 +38,41 @@ def run_operation(operation):
                                    capture_output=True, text=True, timeout=15, check=False)
             if dirty.returncode or dirty.stdout.strip():
                 raise RuntimeError("Update stopped because the installation directory contains local changes")
-            image_result = subprocess.run(COMPOSE + ["images", "-q", "vpnshop"], cwd=PROJECT_DIR,
-                                          capture_output=True, text=True, timeout=30, check=False)
-            old_image = next((line.strip() for line in image_result.stdout.splitlines() if line.strip()), "")
-            image_name = ""
-            containers = subprocess.run(COMPOSE + ["ps", "-q", "vpnshop"], cwd=PROJECT_DIR,
+            previous_images = {}
+            for service in APP_SERVICES:
+                images = subprocess.run(COMPOSE + ["images", "-q", service], cwd=PROJECT_DIR,
                                         capture_output=True, text=True, timeout=30, check=False)
-            if containers.stdout.strip():
-                inspected = subprocess.run(["docker", "inspect", "-f", "{{.Config.Image}}", containers.stdout.splitlines()[0]],
-                                           capture_output=True, text=True, timeout=15, check=False)
-                image_name = inspected.stdout.strip()
+                containers = subprocess.run(COMPOSE + ["ps", "-q", service], cwd=PROJECT_DIR,
+                                            capture_output=True, text=True, timeout=30, check=False)
+                container_id = containers.stdout.splitlines()[0].strip() if containers.stdout.strip() else ""
+                image_name = ""
+                if container_id:
+                    inspected = subprocess.run(["docker", "inspect", "-f", "{{.Config.Image}}", container_id],
+                                               capture_output=True, text=True, timeout=15, check=False)
+                    image_name = inspected.stdout.strip()
+                image_id = next((line.strip() for line in images.stdout.splitlines() if line.strip()), "")
+                if image_id and image_name:
+                    previous_images[service] = (image_id, image_name)
             pulled = subprocess.run(["git", "-C", PROJECT_DIR, "pull", "--ff-only", "origin", "main"],
                                     capture_output=True, text=True, timeout=120, check=False)
             print("update git: " + (pulled.stdout + pulled.stderr).strip(), flush=True)
             if pulled.returncode:
                 raise RuntimeError((pulled.stdout + pulled.stderr)[-12000:] or "git pull failed")
-            result = subprocess.run(COMPOSE + ["build", "vpnshop"], cwd=PROJECT_DIR,
+            result = subprocess.run(COMPOSE + ["build", *APP_SERVICES], cwd=PROJECT_DIR,
                                     capture_output=True, text=True, timeout=900, check=False)
             print("update build: " + (result.stdout + result.stderr).strip(), flush=True)
             if result.returncode:
                 subprocess.run(["git", "-C", PROJECT_DIR, "reset", "--hard", previous_revision],
                                capture_output=True, text=True, timeout=30, check=False)
                 raise RuntimeError((result.stdout + result.stderr)[-12000:] or "docker compose build failed")
-            result = subprocess.run(COMPOSE + ["up", "-d", "--no-deps", "vpnshop"], cwd=PROJECT_DIR,
+            result = subprocess.run(COMPOSE + ["up", "-d", "vpnshop-init", *RUNTIME_SERVICES], cwd=PROJECT_DIR,
                                     capture_output=True, text=True, timeout=180, check=False)
             print("update deploy: " + (result.stdout + result.stderr).strip(), flush=True)
             if result.returncode:
-                if old_image and image_name:
+                for old_image, image_name in previous_images.values():
                     subprocess.run(["docker", "image", "tag", old_image, image_name], timeout=30, check=False)
-                    subprocess.run(COMPOSE + ["up", "-d", "--no-deps", "--no-build", "vpnshop"],
-                                   cwd=PROJECT_DIR, capture_output=True, text=True, timeout=180, check=False)
+                subprocess.run(COMPOSE + ["up", "-d", "--no-deps", "--no-build", *RUNTIME_SERVICES],
+                               cwd=PROJECT_DIR, capture_output=True, text=True, timeout=240, check=False)
                 subprocess.run(["git", "-C", PROJECT_DIR, "reset", "--hard", previous_revision],
                                capture_output=True, text=True, timeout=30, check=False)
                 raise RuntimeError((result.stdout + result.stderr)[-12000:] or "vpnshop restart failed")
@@ -86,10 +93,10 @@ def run_operation(operation):
                 time.sleep(5)
             if not healthy:
                 # Retain and restore the exact previous image, then return the checkout to its known revision.
-                if old_image and image_name:
+                for old_image, image_name in previous_images.values():
                     subprocess.run(["docker", "image", "tag", old_image, image_name], timeout=30, check=False)
-                    subprocess.run(COMPOSE + ["up", "-d", "--no-deps", "--no-build", "vpnshop"],
-                                   cwd=PROJECT_DIR, capture_output=True, text=True, timeout=180, check=False)
+                subprocess.run(COMPOSE + ["up", "-d", "--no-deps", "--no-build", *RUNTIME_SERVICES],
+                               cwd=PROJECT_DIR, capture_output=True, text=True, timeout=240, check=False)
                 subprocess.run(["git", "-C", PROJECT_DIR, "reset", "--hard", previous_revision],
                                capture_output=True, text=True, timeout=30, check=False)
                 raise RuntimeError("New version did not become healthy; previous image and source revision were restored")
@@ -142,7 +149,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             lines = int(parse_qs(parsed.query).get("lines", ["500"])[0])
             lines = max(50, min(lines, 1000))
-            output = self._run(["logs", "--no-color", "--tail=" + str(lines), "vpnshop", "vpnshop-control"], timeout=30)
+            output = self._run(["logs", "--no-color", "--tail=" + str(lines), *APP_SERVICES, "db", "vpnshop-control"], timeout=30)
             self._reply(200, output, "text/plain")
         except Exception as exc:
             self._reply(502, json.dumps({"error": str(exc)}))

@@ -5,6 +5,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     bot_token: str = ""
     database_url: str = "sqlite:///./data/vpnshop.db"
+    app_role: str = "all"
+    db_pool_size: int = 5
+    db_max_overflow: int = 5
+    worker_poll_seconds: float = 1.0
+    worker_concurrency: int = 2
     public_base_url: str = "http://localhost:8000"
     admin_user: str = "admin"
     admin_password: str = "change-me"

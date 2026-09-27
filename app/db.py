@@ -1,6 +1,6 @@
 from pathlib import Path
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, DateTime, Boolean, Float, Text, create_engine, inspect, text
+from sqlalchemy import String, Integer, DateTime, Boolean, Float, Text, Index, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from app.config import settings
 
@@ -113,6 +113,9 @@ class TrialClaim(Base):
 class PendingPayment(Base):
     """Temporary mapping needed to connect a payment webhook to a Telegram account."""
     __tablename__ = "pending_payments"
+    __table_args__ = (Index("uq_pending_immediate_switch_user", "telegram_id", unique=True,
+                            postgresql_where=text("immediate_switch = true"),
+                            sqlite_where=text("immediate_switch = 1")),)
     invoice_id: Mapped[str] = mapped_column(String(100), primary_key=True)
     telegram_id: Mapped[int] = mapped_column(Integer, index=True)
     plan_id: Mapped[int] = mapped_column(Integer, default=0)
@@ -138,6 +141,7 @@ class PendingPayment(Base):
 
 class Subscription(Base):
     __tablename__ = "subscriptions"
+    __table_args__ = (Index("ix_subscriptions_enabled_expires", "enabled", "expires_at"),)
     telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     sub_id: Mapped[str] = mapped_column(String(100), unique=True)
@@ -158,6 +162,8 @@ class Subscription(Base):
 
 class FulfillmentJob(Base):
     __tablename__ = "fulfillment_jobs"
+    __table_args__ = (Index("ix_fulfillment_claim", "status", "next_attempt_at", "created_at"),
+                      Index("ix_fulfillment_stale_claim", "status", "claimed_at"))
     invoice_id: Mapped[str] = mapped_column(String(100), primary_key=True)
     status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
@@ -172,6 +178,9 @@ class FulfillmentJob(Base):
 
 class SubscriptionHistory(Base):
     __tablename__ = "subscription_history"
+    __table_args__ = (Index("ix_subscription_history_user_start", "telegram_id", "starts_at"),
+                      Index("ix_subscription_history_start", "starts_at"),
+                      Index("ix_subscription_history_plan", "plan_name"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     telegram_id: Mapped[int] = mapped_column(Integer, index=True)
     plan_name: Mapped[str] = mapped_column(String(100))
@@ -209,7 +218,13 @@ if settings.database_url.startswith("sqlite"):
     db_path = settings.database_url.removeprefix("sqlite:///")
     if db_path != ":memory:":
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-engine = create_engine(settings.database_url, connect_args={"check_same_thread": False} if settings.database_url.startswith("sqlite") else {})
+engine_options = {"pool_pre_ping": True, "pool_recycle": 1800}
+if settings.database_url.startswith("sqlite"):
+    engine_options["connect_args"] = {"check_same_thread": False}
+else:
+    engine_options.update(pool_size=max(1, settings.db_pool_size),
+                          max_overflow=max(0, settings.db_max_overflow), pool_timeout=30)
+engine = create_engine(settings.database_url, **engine_options)
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 
 
@@ -316,3 +331,6 @@ def init_db():
                 Subscription.plan_id.is_(None), Subscription.plan_name == plan.name
             ).update({Subscription.plan_id: plan.id}, synchronize_session=False)
         db.commit()
+    for table in Base.metadata.tables.values():
+        for index in table.indexes:
+            index.create(engine, checkfirst=True)

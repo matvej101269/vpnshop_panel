@@ -11,13 +11,12 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from collections import Counter
-from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi import FastAPI, Request, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import httpx
-from sqlalchemy import select, func
+from sqlalchemy import select, func, and_, or_
 from urllib.parse import unquote, urlsplit
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings as env_settings
@@ -118,12 +117,14 @@ async def process_payment_jobs():
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     with SessionLocal() as db:
         stale_claim = now - timedelta(minutes=30)
-        db.query(FulfillmentJob).filter(FulfillmentJob.status == "processing",
-                                         (FulfillmentJob.claimed_at.is_(None) | (FulfillmentJob.claimed_at < stale_claim))).update(
-            {FulfillmentJob.status: "retry", FulfillmentJob.next_attempt_at: now}, synchronize_session=False)
-        jobs = db.scalars(select(FulfillmentJob).where(
-            FulfillmentJob.status.in_(["queued", "retry"]), FulfillmentJob.next_attempt_at <= now
-        ).order_by(FulfillmentJob.created_at).limit(20)).all()
+        eligible = or_(and_(FulfillmentJob.status.in_(["queued", "retry"]),
+                            FulfillmentJob.next_attempt_at <= now),
+                       and_(FulfillmentJob.status == "processing",
+                            or_(FulfillmentJob.claimed_at.is_(None),
+                                FulfillmentJob.claimed_at < stale_claim)))
+        jobs = db.scalars(select(FulfillmentJob).where(eligible)
+                          .order_by(FulfillmentJob.created_at)
+                          .limit(1).with_for_update(skip_locked=True)).all()
         ids = [job.invoice_id for job in jobs]
         for job in jobs:
             job.status = "processing"
@@ -254,25 +255,34 @@ async def call_control_api(method: str, path: str, timeout: float = 30):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-    init_runtime_config()
-    scheduler.add_job(send_reminders, "interval", hours=6, id="reminders", replace_existing=True)
-    scheduler.add_job(purge_old_pending_payments, "interval", hours=6, id="pending-retention", replace_existing=True)
-    scheduler.add_job(process_payment_jobs, "interval", seconds=15, id="payment-fulfillment", replace_existing=True,
-                      max_instances=1, coalesce=True)
-    scheduler.add_job(reconcile_addon_balances, "interval", seconds=60, id="traffic-addons",
-                      replace_existing=True, max_instances=1, coalesce=True)
-    scheduler.add_job(create_backup, "interval", hours=24, id="daily-backup", replace_existing=True,
-                      next_run_time=datetime.now(timezone.utc) + timedelta(minutes=1))
-    scheduler.add_job(reconcile_subscriptions, "interval", hours=24, id="3xui-reconciliation", replace_existing=True,
-                      next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2))
-    scheduler.start()
-    await restart_bot_runtime()
+    if env_settings.app_role == "all":
+        init_db()
+        init_runtime_config()
+    elif env_settings.app_role == "web":
+        # Schema and first-boot secrets are initialized by the one-shot init service.
+        with SessionLocal() as db:
+            db.execute(select(func.count()).select_from(AdminAccount)).scalar_one()
+    else:
+        raise RuntimeError("The web application can only run with APP_ROLE=web or all")
+    if env_settings.app_role == "all":
+        scheduler.add_job(send_reminders, "interval", hours=6, id="reminders", replace_existing=True)
+        scheduler.add_job(purge_old_pending_payments, "interval", hours=6, id="pending-retention", replace_existing=True)
+        scheduler.add_job(process_payment_jobs, "interval", seconds=1, id="payment-fulfillment", replace_existing=True,
+                          max_instances=1, coalesce=True)
+        scheduler.add_job(reconcile_addon_balances, "interval", seconds=60, id="traffic-addons",
+                          replace_existing=True, max_instances=1, coalesce=True)
+        scheduler.add_job(create_backup, "interval", hours=24, id="daily-backup", replace_existing=True,
+                          next_run_time=datetime.now(timezone.utc) + timedelta(minutes=1))
+        scheduler.add_job(reconcile_subscriptions, "interval", hours=24, id="3xui-reconciliation", replace_existing=True,
+                          next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2))
+        scheduler.start()
+        await restart_bot_runtime()
     yield
-    scheduler.shutdown(wait=False)
-    if bot_task:
-        bot_task.cancel()
-        await asyncio.gather(bot_task, return_exceptions=True)
+    if env_settings.app_role == "all":
+        scheduler.shutdown(wait=False)
+        if bot_task:
+            bot_task.cancel()
+            await asyncio.gather(bot_task, return_exceptions=True)
 
 
 app = FastAPI(title="VPN Shop", lifespan=lifespan)
@@ -519,7 +529,9 @@ async def admin_root(_: None = Depends(admin)):
 
 
 @app.get("/admin/{section}", response_class=HTMLResponse)
-async def admin_page(section: str, request: Request, _: None = Depends(admin)):
+async def admin_page(section: str, request: Request, page: int = Query(1, ge=1),
+                     sort: str = Query("telegram_id"), direction: str = Query("asc"),
+                     _: None = Depends(admin)):
     if section not in SECTIONS:
         raise HTTPException(status_code=404)
     ctx = {"request": request, "section": section,
@@ -529,20 +541,24 @@ async def admin_page(section: str, request: Request, _: None = Depends(admin)):
             now = datetime.now(timezone.utc)
             month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None)
             current_month_end = (now.replace(day=28) + timedelta(days=4)).replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
-            subs = db.scalars(select(Subscription)).all()
             all_plans = db.scalars(select(Plan)).all()
-            active = [s for s in subs if s.enabled and as_utc(s.expires_at) > now]
-            inactive = [s for s in subs if not s.enabled or as_utc(s.expires_at) <= now]
-            expiring = [s for s in active if as_utc(s.expires_at) <= now + timedelta(days=7)]
-            history = db.scalars(select(SubscriptionHistory)).all()
-            first_start_by_user = {}
-            for item in history:
-                first_start_by_user[item.telegram_id] = min(first_start_by_user.get(item.telegram_id, item.starts_at), item.starts_at)
-            new_users_by_month = {tg_id: starts for tg_id, starts in first_start_by_user.items()}
-            current_month = [starts for starts in new_users_by_month.values() if starts >= month_start]
-            churn = sum(1 for s in subs if month_start <= as_utc(s.expires_at).replace(tzinfo=None) < current_month_end)
-            plans = Counter(h.plan_name for h in history)
-            popular = sorted(plans.items(), key=lambda item: (-item[1], item[0]))[:7]
+            active_filter = and_(Subscription.enabled.is_(True), Subscription.expires_at > now.replace(tzinfo=None))
+            active_count = db.scalar(select(func.count()).select_from(Subscription).where(active_filter)) or 0
+            total_count = db.scalar(select(func.count()).select_from(Subscription)) or 0
+            first_starts = select(SubscriptionHistory.telegram_id,
+                                  func.min(SubscriptionHistory.starts_at).label("first_start")
+                                  ).group_by(SubscriptionHistory.telegram_id).subquery()
+            current_month = db.scalar(select(func.count()).select_from(first_starts).where(
+                first_starts.c.first_start >= month_start)) or 0
+            churn = db.scalar(select(func.count()).select_from(Subscription).where(
+                Subscription.expires_at >= month_start, Subscription.expires_at < current_month_end)) or 0
+            popular = db.execute(select(SubscriptionHistory.plan_name, func.count().label("uses"))
+                                 .group_by(SubscriptionHistory.plan_name)
+                                 .order_by(func.count().desc(), SubscriptionHistory.plan_name).limit(7)).all()
+            expiring_query = select(Subscription).where(
+                active_filter, Subscription.expires_at <= (now + timedelta(days=7)).replace(tzinfo=None)
+            ).order_by(Subscription.expires_at)
+            expiring = db.scalars(expiring_query.limit(8)).all()
             months = []
             for back in range(5, -1, -1):
                 index = now.year * 12 + now.month - 1 - back
@@ -551,41 +567,71 @@ async def admin_page(section: str, request: Request, _: None = Depends(admin)):
                 next_index = index + 1
                 next_year, next_month_no = divmod(next_index, 12)
                 next_month = datetime(next_year, next_month_no + 1, 1, tzinfo=timezone.utc)
-                count_in = sum(1 for started in first_start_by_user.values() if month.replace(tzinfo=None) <= started < next_month.replace(tzinfo=None))
-                count_out = sum(1 for s in subs if month.replace(tzinfo=None) <= as_utc(s.expires_at).replace(tzinfo=None) < next_month.replace(tzinfo=None))
+                count_in = db.scalar(select(func.count()).select_from(first_starts).where(
+                    first_starts.c.first_start >= month.replace(tzinfo=None),
+                    first_starts.c.first_start < next_month.replace(tzinfo=None))) or 0
+                count_out = db.scalar(select(func.count()).select_from(Subscription).where(
+                    Subscription.expires_at >= month.replace(tzinfo=None),
+                    Subscription.expires_at < next_month.replace(tzinfo=None))) or 0
                 months.append({"label": month.strftime("%b"), "incoming": count_in, "outgoing": count_out})
-            ctx.update(active_count=len(active), inactive_count=len(inactive), expiring_count=len(expiring),
-                       incoming_count=len(current_month), outgoing_count=churn, popular=popular, months=months,
-                       expiring=[{"sub": s, "days": remaining_days(s.expires_at)} for s in sorted(expiring, key=lambda s: s.expires_at)[:8]],
+            expiring_count = db.scalar(select(func.count()).select_from(Subscription).where(
+                active_filter, Subscription.expires_at <= (now + timedelta(days=7)).replace(tzinfo=None))) or 0
+            ctx.update(active_count=active_count, inactive_count=total_count-active_count,
+                       expiring_count=expiring_count, incoming_count=current_month,
+                       outgoing_count=churn, popular=[(row.plan_name, row.uses) for row in popular], months=months,
+                       expiring=[{"sub": s, "days": remaining_days(s.expires_at)} for s in expiring],
                        enabled_plans=sum(1 for plan in all_plans if plan.enabled),
                        pending_count=db.scalar(select(func.count()).select_from(PendingPayment)))
         elif section == "users":
-            subs = db.scalars(select(Subscription).order_by(Subscription.telegram_id)).all()
+            sort_columns = {"telegram_id": Subscription.telegram_id, "plan_name": Subscription.plan_name,
+                            "expires_at": Subscription.expires_at, "current_price": Subscription.current_price,
+                            "enabled": Subscription.enabled}
+            sort_column = sort_columns.get(sort, Subscription.telegram_id)
+            ordering = sort_column.desc() if direction == "desc" else sort_column.asc()
+            page_size = 100
+            total = db.scalar(select(func.count()).select_from(Subscription)) or 0
+            page_count = max(1, (total + page_size - 1) // page_size)
+            page = min(page, page_count)
+            subs = db.scalars(select(Subscription).order_by(ordering, Subscription.telegram_id)
+                              .offset((page - 1) * page_size).limit(page_size)).all()
+            try:
+                usage_by_email = {str(client.get("email", "")): client.get("used_bytes")
+                                  for client in await XUIClient().list_clients()}
+            except Exception:
+                logger.exception("Unable to load client traffic in one 3x-ui batch")
+                usage_by_email = {}
             rows = []
-            for index, sub in enumerate(subs, start=1):
-                try:
-                    used = await XUIClient().client_usage(sub.sub_id, sub.telegram_id)
-                except Exception:
-                    used = None
+            for index, sub in enumerate(subs, start=(page - 1) * page_size + 1):
+                used = usage_by_email.get(str(sub.telegram_id), usage_by_email.get(f"sub-{sub.sub_id}@vpn.invalid"))
                 remaining = None if sub.traffic_limit_bytes == 0 else max(0, sub.traffic_limit_bytes - used) if used is not None else None
                 rows.append({"number": index, "sub": sub, "remaining_days": remaining_days(sub.expires_at),
                              "active": sub.enabled and as_utc(sub.expires_at) > datetime.now(timezone.utc),
                              "used": used, "remaining_bytes": remaining})
-            ctx["rows"] = rows
+            ctx.update(rows=rows, page=page, page_count=page_count, total_users=total,
+                       sort=sort, direction=direction)
             ctx["manual_plans"] = db.scalars(select(Plan).where(Plan.enabled.is_(True)).order_by(Plan.days)).all()
         elif section == "subscriptions":
             plans = db.scalars(select(Plan).order_by(Plan.days)).all()
-            subscriptions = db.scalars(select(Subscription)).all()
             ctx["plans"] = plans
-            ctx["plan_users"] = {
-                plan.id: sum(1 for sub in subscriptions
-                             if sub.plan_id == plan.id or (sub.plan_id is None and sub.plan_name == plan.name))
-                for plan in plans
-            }
+            by_plan = dict(db.execute(select(Subscription.plan_id, func.count())
+                                      .where(Subscription.plan_id.is_not(None))
+                                      .group_by(Subscription.plan_id)).all())
+            legacy_counts = dict(db.execute(select(Subscription.plan_name, func.count())
+                                            .where(Subscription.plan_id.is_(None))
+                                            .group_by(Subscription.plan_name)).all())
+            ctx["plan_users"] = {plan.id: by_plan.get(plan.id, 0) + legacy_counts.get(plan.name, 0)
+                                 for plan in plans}
         elif section == "addons":
             ctx["packages"] = db.scalars(select(AddonPackage).order_by(AddonPackage.traffic_gb)).all()
         elif section == "history":
-            ctx["history"] = db.scalars(select(SubscriptionHistory).order_by(SubscriptionHistory.starts_at.desc())).all()
+            page_size = 100
+            total = db.scalar(select(func.count()).select_from(SubscriptionHistory)) or 0
+            page_count = max(1, (total + page_size - 1) // page_size)
+            page = min(page, page_count)
+            ctx.update(history=db.scalars(select(SubscriptionHistory)
+                                         .order_by(SubscriptionHistory.starts_at.desc(), SubscriptionHistory.id.desc())
+                                         .offset((page - 1) * page_size).limit(page_size)).all(),
+                       page=page, page_count=page_count, total_history=total)
         elif section == "settings":
             config = {key: get_config(key) for key in CONFIG_DEFAULTS if key not in SECRET_KEYS}
             config["selected_inbounds"] = [int(v) for v in config.get("xui_inbound_ids", "").split(",") if v.isdigit()]
