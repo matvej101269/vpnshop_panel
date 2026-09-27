@@ -18,6 +18,9 @@ class Plan(Base):
     currency: Mapped[str] = mapped_column(String(8), default="RUB")
     traffic_limit_gb: Mapped[float] = mapped_column(Float, default=0)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    show_in_bot: Mapped[bool] = mapped_column(Boolean, default=True)
+    limit_hwid: Mapped[int] = mapped_column(Integer, default=0)
+    traffic_reset: Mapped[str] = mapped_column(String(16), default="never")
 
 
 class BotMenuNode(Base):
@@ -33,12 +36,25 @@ class BotMenuNode(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class AddonPackage(Base):
+    __tablename__ = "addon_packages"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    traffic_gb: Mapped[float] = mapped_column(Float)
+    amount: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(8), default="RUB")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
 class PendingPayment(Base):
     """Temporary mapping needed to connect a payment webhook to a Telegram account."""
     __tablename__ = "pending_payments"
     invoice_id: Mapped[str] = mapped_column(String(100), primary_key=True)
     telegram_id: Mapped[int] = mapped_column(Integer, index=True)
-    plan_id: Mapped[int] = mapped_column(Integer)
+    plan_id: Mapped[int] = mapped_column(Integer, default=0)
+    product_type: Mapped[str] = mapped_column(String(16), default="plan")
+    package_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    package_traffic_bytes: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -52,6 +68,9 @@ class Subscription(Base):
     current_price: Mapped[int] = mapped_column(Integer, default=0)
     currency: Mapped[str] = mapped_column(String(8), default="RUB")
     traffic_limit_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    limit_hwid: Mapped[int] = mapped_column(Integer, default=0)
+    traffic_reset: Mapped[str] = mapped_column(String(16), default="never")
+    inbound_ids: Mapped[str] = mapped_column(Text, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     reminded: Mapped[str] = mapped_column(String(100), default="")
 
@@ -122,13 +141,24 @@ def init_db():
     # Small in-place SQLite schema upgrade for databases created by earlier app revisions.
     if settings.database_url.startswith("sqlite"):
         upgrades = {
-            "plans": {"traffic_limit_gb": "FLOAT NOT NULL DEFAULT 0"},
+            "plans": {"traffic_limit_gb": "FLOAT NOT NULL DEFAULT 0",
+                      "show_in_bot": "BOOLEAN NOT NULL DEFAULT 1",
+                      "limit_hwid": "INTEGER NOT NULL DEFAULT 0",
+                      "traffic_reset": "VARCHAR(16) NOT NULL DEFAULT 'never'"},
+            "pending_payments": {
+                "product_type": "VARCHAR(16) NOT NULL DEFAULT 'plan'",
+                "package_id": "INTEGER",
+                "package_traffic_bytes": "INTEGER NOT NULL DEFAULT 0",
+            },
             "subscriptions": {
                 "plan_id": "INTEGER",
                 "plan_name": "VARCHAR(100) NOT NULL DEFAULT ''",
                 "current_price": "INTEGER NOT NULL DEFAULT 0",
                 "currency": "VARCHAR(8) NOT NULL DEFAULT 'RUB'",
                 "traffic_limit_bytes": "INTEGER NOT NULL DEFAULT 0",
+                "limit_hwid": "INTEGER NOT NULL DEFAULT 0",
+                "traffic_reset": "VARCHAR(16) NOT NULL DEFAULT 'never'",
+                "inbound_ids": "TEXT NOT NULL DEFAULT ''",
             },
             "subscription_history": {
                 "price": "INTEGER NOT NULL DEFAULT 0",

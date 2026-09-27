@@ -1,3 +1,30 @@
-<div class="title-row"><div><h1>Подписки</h1><div class="subtitle">Тарифы, сроки, цены и лимиты трафика</div></div></div>
-<section class="section"><div class="section-head"><div><h2>Новый тариф</h2><p>Лимит трафика 0 означает безлимит</p></div></div><form class="form-grid" method="post" action="/admin/subscriptions"><input name="name" placeholder="Название" required><input name="days" type="number" min="1" placeholder="Дней" required><input name="amount" type="number" min="1" placeholder="Цена" required><input name="currency" value="RUB" maxlength="8"><input name="traffic_limit_gb" type="number" min="0" step="0.1" placeholder="ГБ, 0 — безлимит" value="0"><button>Создать</button></form>
-<div class="table-wrap"><table><thead><tr><th>НАЗВАНИЕ</th><th>ДНИ</th><th>ЦЕНА</th><th>ВАЛЮТА</th><th>ТРАФИК, ГБ</th><th>ВКЛЮЧЁН</th><th>ПОЛЬЗОВАТЕЛИ</th><th></th></tr></thead><tbody>{% for p in plans %}{% set form_id = 'plan-' ~ p.id %}<tr><td><form id="{{form_id}}" method="post" action="/admin/subscriptions/{{p.id}}/edit"></form><input form="{{form_id}}" name="name" value="{{p.name}}" required></td><td><input form="{{form_id}}" name="days" type="number" min="1" value="{{p.days}}" required style="width:75px"></td><td><input form="{{form_id}}" name="amount" type="number" min="1" value="{{p.amount}}" required style="width:90px"></td><td><input form="{{form_id}}" name="currency" value="{{p.currency}}" style="width:68px"></td><td><input form="{{form_id}}" name="traffic_limit_gb" type="number" min="0" step="0.1" value="{{p.traffic_limit_gb}}" style="width:105px"></td><td><input form="{{form_id}}" type="checkbox" name="enabled" {{'checked' if p.enabled else ''}}></td><td>{{plan_users[p.id]}}</td><td><div class="actions"><button form="{{form_id}}" class="btn-quiet">Сохранить</button>{% if plan_users[p.id] == 0 %}<form method="post" action="/admin/subscriptions/{{p.id}}/delete" onsubmit="return confirm('Удалить тариф {{p.name}}?')"><button class="btn-danger">Удалить</button></form>{% else %}<span class="mini">Используется</span>{% endif %}</div></td></tr>{% else %}<tr><td colspan="8" class="empty">Добавьте тариф</td></tr>{% endfor %}</tbody></table></div></section>
+<div class="title-row"><div><h1>Подписки и тарифы</h1><div class="subtitle">Срок, стоимость, трафик, устройства и видимость тарифов в боте</div></div></div>
+<section class="section"><div class="section-head"><div><h2>Новый тариф</h2><p>0 ГБ — без ограничений. Сброс задаётся в 3x-ui при создании клиента.</p></div></div>
+<form method="post" action="/admin/subscriptions" class="form-panel">
+<div class="plan-fields">
+<label>Название<input name="name" required maxlength="100"></label>
+<label>Дней<input name="days" type="number" min="1" required><small>Срок подписки</small></label>
+<label>Цена<input name="amount" type="number" min="1" required></label>
+<label>Валюта<input name="currency" value="RUB" maxlength="8"></label>
+<label>Трафик, ГБ<input name="traffic_limit_gb" type="number" min="0" step="0.1" value="0"><small>0 — без ограничений</small></label>
+<label>Количество устройств<input name="limit_hwid" type="number" min="0" value="0"><small>0 — без ограничений</small></label>
+<label>Сброс трафика<select name="traffic_reset"><option value="never">Никогда</option><option value="hourly">Ежечасно</option><option value="daily">Ежедневно</option><option value="weekly">Еженедельно</option><option value="monthly">Ежемесячно</option></select></label>
+<label class="check-label"><input type="checkbox" name="enabled" checked> Включён</label>
+<label class="check-label"><input type="checkbox" name="show_in_bot" checked> Отображать в боте</label>
+</div><button>Создать тариф</button></form></section>
+
+<section class="section"><div class="section-head"><div><h2>Тарифы</h2><p>Снятие «Отображать в боте» оставляет тариф доступным для ручного подключения из панели.</p></div><span class="mini">{{plans|length}} тарифов</span></div>
+<div class="table-wrap"><table><thead><tr><th>НАЗВАНИЕ</th><th>ДНЕЙ</th><th>ЦЕНА</th><th>ВАЛЮТА</th><th>ТРАФИК, ГБ</th><th>УСТРОЙСТВА</th><th>СБРОС</th><th>БОТ</th><th>ВКЛЮЧЁН</th><th>ПОЛЬЗОВАТЕЛИ</th><th></th></tr></thead><tbody>
+{% for p in plans %}{% set form_id = 'plan-' ~ p.id %}<tr>
+<td><form id="{{form_id}}" method="post" action="/admin/subscriptions/{{p.id}}/edit"></form><input form="{{form_id}}" name="name" value="{{p.name}}" required></td>
+<td><input form="{{form_id}}" name="days" type="number" min="1" value="{{p.days}}" required style="width:75px"></td>
+<td><input form="{{form_id}}" name="amount" type="number" min="1" value="{{p.amount}}" required style="width:90px"></td>
+<td><input form="{{form_id}}" name="currency" value="{{p.currency}}" style="width:68px"></td>
+<td><label class="cell-field"><input form="{{form_id}}" name="traffic_limit_gb" type="number" min="0" step="0.1" value="{{p.traffic_limit_gb}}"><small>0 — без ограничений</small></label></td>
+<td><input form="{{form_id}}" name="limit_hwid" type="number" min="0" value="{{p.limit_hwid}}" style="width:85px" title="0 — без ограничений"></td>
+<td><select form="{{form_id}}" name="traffic_reset">{% for val,label in [('never','Никогда'),('hourly','Ежечасно'),('daily','Ежедневно'),('weekly','Еженедельно'),('monthly','Ежемесячно')] %}<option value="{{val}}" {{'selected' if p.traffic_reset == val else ''}}>{{label}}</option>{% endfor %}</select></td>
+<td><input form="{{form_id}}" type="checkbox" name="show_in_bot" {{'checked' if p.show_in_bot else ''}} aria-label="Отображать в боте"></td>
+<td><input form="{{form_id}}" type="checkbox" name="enabled" {{'checked' if p.enabled else ''}} aria-label="Тариф включён"></td>
+<td>{{plan_users[p.id]}}</td><td><div class="actions"><button form="{{form_id}}" class="btn-quiet">Сохранить</button>{% if plan_users[p.id] == 0 %}<form method="post" action="/admin/subscriptions/{{p.id}}/delete" onsubmit="return confirm('Удалить тариф {{p.name}}?')"><button class="btn-danger">Удалить</button></form>{% else %}<span class="mini">Используется</span>{% endif %}</div></td>
+</tr>{% else %}<tr><td colspan="11" class="empty">Добавьте первый тариф</td></tr>{% endfor %}</tbody></table></div></section>
+<style>.plan-fields{display:grid;grid-template-columns:repeat(3,minmax(150px,1fr));gap:14px;margin-bottom:16px}.plan-fields>label,.cell-field{display:flex;flex-direction:column;gap:6px;color:#bac4d0;font-size:12px}.plan-fields input,.plan-fields select{width:100%}.plan-fields small,.cell-field small{font-size:10px;color:var(--muted)}.plan-fields .check-label{flex-direction:row;align-items:center}.cell-field{min-width:125px}.actions form{display:inline}.actions{flex-wrap:wrap}@media(max-width:850px){.plan-fields{grid-template-columns:1fr 1fr}}</style>

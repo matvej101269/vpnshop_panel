@@ -1,12 +1,11 @@
 import json
 import uuid
 import hashlib
-import math
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import httpx
 from app.config import settings as env_settings
-from app.db import SessionLocal, Plan, PendingPayment, Subscription, SubscriptionHistory, ProcessedPayment
+from app.db import SessionLocal, Plan, AddonPackage, PendingPayment, Subscription, SubscriptionHistory, ProcessedPayment
 from app.runtime_config import get_config_map
 
 
@@ -34,47 +33,100 @@ class LavaClient:
 
 
 class XUIClient:
-    async def add_or_update_client(self, telegram_id: int, sub_id: str, expiry_ms: int, traffic_limit_bytes: int, exists: bool):
+    @staticmethod
+    def _inbound_ids(cfg: dict, inbound_ids: list[int] | None = None) -> list[int]:
+        values = inbound_ids or [int(v) for v in cfg.get("xui_inbound_ids", "").split(",") if v.strip().isdigit()]
+        if not values:
+            values = [int(cfg.get("xui_inbound_id", "1"))]
+        return sorted(set(int(v) for v in values if int(v) > 0))
+
+    @staticmethod
+    def _email(telegram_id: int) -> str:
+        return str(telegram_id)
+
+    async def add_or_update_client(self, telegram_id: int, sub_id: str, expiry_ms: int, traffic_limit_bytes: int,
+                                   exists: bool, limit_hwid: int = 0, traffic_reset: str = "never",
+                                   inbound_ids: list[int] | None = None, enabled: bool = True):
         cfg = get_config_map()
         if not cfg["xui_base_url"] or (not cfg["xui_api_token"] and not all((cfg["xui_username"], cfg["xui_password"]))):
             raise RuntimeError("Не настроено подключение к 3x-ui")
         base = cfg["xui_base_url"].rstrip("/")
         api = base + "/" + cfg["xui_api_base_path"].strip("/")
-        # 3x-ui requires a client email value. Derive it from the random subscription token,
-        # so the panel does not receive the Telegram ID or an actual email address.
-        client_email = f"sub-{sub_id}@vpn.invalid"
+        client_email = self._email(telegram_id)
+        legacy_email = f"sub-{sub_id}@vpn.invalid"
         client_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"vpnshop:{sub_id}"))
+        targets = self._inbound_ids(cfg, inbound_ids)
+        client_data = {"id": client_uuid, "email": client_email, "expiryTime": expiry_ms, "enable": enabled,
+                       "limitIp": 0, "limitHwid": max(0, int(limit_hwid)),
+                       # 3x-ui's totalGB field is stored in bytes (despite its name).
+                       "totalGB": max(0, int(traffic_limit_bytes)), "trafficReset": traffic_reset,
+                       "trafficResetDay": 1, "subId": sub_id, "tgId": 0}
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             if cfg["xui_api_token"]:
                 headers = {"Authorization": f"Bearer {cfg['xui_api_token']}"}
-                body = {"id": client_uuid, "email": client_email, "expiryTime": expiry_ms, "enable": True,
-                        "limitIp": 0, "totalGB": math.ceil(traffic_limit_bytes / (1024 ** 3)), "subId": sub_id, "tgId": 0}
                 if exists:
-                    response = await client.post(f"{api}/clients/update/{quote(client_email)}", json=body, headers=headers)
+                    response = await client.post(f"{api}/clients/update/{quote(client_email)}", json=client_data, headers=headers)
+                    if response.status_code == 404:
+                        response = await client.post(f"{api}/clients/update/{quote(legacy_email)}", json=client_data, headers=headers)
                 else:
                     response = await client.post(f"{api}/clients/add", json={
-                    "client": body, "inboundIds": [int(cfg["xui_inbound_id"]) ]}, headers=headers)
+                        "client": client_data, "inboundIds": targets}, headers=headers)
             else:
                 login = await client.post(f"{base}/{cfg['xui_login_path'].lstrip('/')}", data={"username": cfg["xui_username"], "password": cfg["xui_password"]})
                 login.raise_for_status()
-                body = {"id": client_uuid, "email": client_email, "enable": True, "expiryTime": expiry_ms,
-                        "limitIp": 0, "totalGB": math.ceil(traffic_limit_bytes / (1024 ** 3)), "subId": sub_id, "tgId": ""}
+                body = client_data
                 if exists:
-                    response = await client.post(f"{api}/inbounds/updateClient/{client_uuid}", json={
-                        "id": int(cfg["xui_inbound_id"]), "settings": json.dumps({"clients": [body]})})
+                    for inbound_id in targets:
+                        response = await client.post(f"{api}/inbounds/updateClient/{client_uuid}", json={
+                            "id": inbound_id, "settings": json.dumps({"clients": [body]})})
+                        response.raise_for_status()
+                        result = response.json()
+                        if result.get("success") is False:
+                            raise RuntimeError(f"3x-ui error: {result.get('msg', 'unknown error')}")
+                    return
                 else:
-                    response = await client.post(f"{api}/inbounds/addClient", json={
-                        "id": int(cfg["xui_inbound_id"]), "settings": json.dumps({"clients": [body]})})
+                    responses = []
+                    for inbound_id in targets:
+                        current_response = await client.post(f"{api}/inbounds/addClient", json={
+                            "id": inbound_id, "settings": json.dumps({"clients": [body]})})
+                        current_response.raise_for_status()
+                        current_result = current_response.json()
+                        if current_result.get("success") is False:
+                            raise RuntimeError(f"3x-ui error: {current_result.get('msg', 'unknown error')}")
+                        responses.append(current_response)
+                    return
             response.raise_for_status()
             result = response.json()
             if result.get("success") is False:
                 raise RuntimeError(f"3x-ui error: {result.get('msg', 'unknown error')}")
 
-    async def client_usage(self, sub_id: str) -> int:
+    async def list_inbounds(self) -> list[dict]:
         cfg = get_config_map()
         base = cfg["xui_base_url"].rstrip("/")
         api = base + "/" + cfg["xui_api_base_path"].strip("/")
-        email = f"sub-{sub_id}@vpn.invalid"
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            headers = {}
+            if cfg["xui_api_token"]:
+                headers["Authorization"] = f"Bearer {cfg['xui_api_token']}"
+            else:
+                login = await client.post(f"{base}/{cfg['xui_login_path'].lstrip('/')}",
+                                          data={"username": cfg["xui_username"], "password": cfg["xui_password"]})
+                login.raise_for_status()
+            response = await client.get(f"{api}/inbounds/list", headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("success") is False:
+                raise RuntimeError(data.get("msg") or "3x-ui returned an error")
+            items = data.get("obj") or []
+            return [{"id": int(item["id"]), "name": str(item.get("remark") or item.get("tag") or f"Inbound {item['id']}"),
+                     "protocol": str(item.get("protocol", "")), "port": int(item.get("port") or 0)} for item in items]
+
+    async def client_usage(self, sub_id: str, telegram_id: int | None = None) -> int:
+        cfg = get_config_map()
+        base = cfg["xui_base_url"].rstrip("/")
+        api = base + "/" + cfg["xui_api_base_path"].strip("/")
+        email = str(telegram_id) if telegram_id is not None else f"sub-{sub_id}@vpn.invalid"
+        legacy_email = f"sub-{sub_id}@vpn.invalid"
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             if cfg["xui_api_token"]:
                 response = await client.get(f"{api}/clients/traffic/{quote(email)}",
@@ -82,30 +134,46 @@ class XUIClient:
             else:
                 await client.post(f"{base}/{cfg['xui_login_path'].lstrip('/')}", data={"username": cfg["xui_username"], "password": cfg["xui_password"]})
                 response = await client.get(f"{api}/inbounds/getClientTraffics/{quote(email)}")
+            if response.status_code == 404 and email != legacy_email:
+                if cfg["xui_api_token"]:
+                    response = await client.get(f"{api}/clients/traffic/{quote(legacy_email)}",
+                                                headers={"Authorization": f"Bearer {cfg['xui_api_token']}"})
+                else:
+                    response = await client.get(f"{api}/inbounds/getClientTraffics/{quote(legacy_email)}")
             response.raise_for_status()
             obj = response.json().get("obj") or {}
             return int(obj.get("up", 0) or 0) + int(obj.get("down", 0) or 0)
 
-    async def delete_client(self, sub_id: str):
+    async def delete_client(self, sub_id: str, telegram_id: int | None = None):
         cfg = get_config_map()
         base = cfg["xui_base_url"].rstrip("/")
         api = base + "/" + cfg["xui_api_base_path"].strip("/")
-        email = f"sub-{sub_id}@vpn.invalid"
+        email = str(telegram_id) if telegram_id is not None else f"sub-{sub_id}@vpn.invalid"
         client_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"vpnshop:{sub_id}"))
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             if cfg["xui_api_token"]:
                 headers = {"Authorization": f"Bearer {cfg['xui_api_token']}"}
                 response = await client.post(f"{api}/clients/del/{quote(email)}?keepTraffic=0", headers=headers)
+                if response.status_code == 404 and telegram_id is not None:
+                    response = await client.post(f"{api}/clients/del/{quote(f'sub-{sub_id}@vpn.invalid')}?keepTraffic=0", headers=headers)
             else:
                 await client.post(f"{base}/{cfg['xui_login_path'].lstrip('/')}", data={"username": cfg["xui_username"], "password": cfg["xui_password"]})
-                response = await client.post(f"{api}/inbounds/{int(cfg['xui_inbound_id'])}/delClient/{client_uuid}")
+                deleted = []
+                for inbound_id in self._inbound_ids(cfg):
+                    response = await client.post(f"{api}/inbounds/{inbound_id}/delClient/{client_uuid}")
+                    if response.status_code != 404:
+                        response.raise_for_status()
+                        deleted.append(inbound_id)
+                if not deleted:
+                    raise RuntimeError("3x-ui did not find this client on selected inbounds")
+                return
             response.raise_for_status()
 
-    async def reset_client_traffic(self, sub_id: str):
+    async def reset_client_traffic(self, sub_id: str, telegram_id: int | None = None):
         cfg = get_config_map()
         base = cfg["xui_base_url"].rstrip("/")
         api = base + "/" + cfg["xui_api_base_path"].strip("/")
-        email = f"sub-{sub_id}@vpn.invalid"
+        email = str(telegram_id) if telegram_id is not None else f"sub-{sub_id}@vpn.invalid"
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             if cfg["xui_api_token"]:
                 response = await client.post(f"{api}/clients/resetTraffic/{quote(email)}",
@@ -113,7 +181,15 @@ class XUIClient:
             else:
                 await client.post(f"{base}/{cfg['xui_login_path'].lstrip('/')}",
                                   data={"username": cfg["xui_username"], "password": cfg["xui_password"]})
-                response = await client.post(f"{api}/inbounds/{int(cfg['xui_inbound_id'])}/resetClientTraffic/{quote(email)}")
+                responses = []
+                for inbound_id in self._inbound_ids(cfg):
+                    current = await client.post(f"{api}/inbounds/{inbound_id}/resetClientTraffic/{quote(email)}")
+                    if current.status_code != 404:
+                        current.raise_for_status()
+                        responses.append(current)
+                if not responses:
+                    raise RuntimeError("3x-ui did not find traffic for this client on selected inbounds")
+                return
             response.raise_for_status()
 
     async def sync_client(self, telegram_id: int, sub_id: str, expires_at: datetime, traffic_limit_bytes: int, exists: bool):
@@ -135,8 +211,30 @@ async def provision_paid_invoice(invoice_id: str) -> tuple[int, str] | str | Non
         if not payment:
             return None
         telegram_id, plan_id = payment.telegram_id, payment.plan_id
-        plan = db.get(Plan, plan_id)
         current = db.get(Subscription, telegram_id)
+        if payment.product_type == "addon":
+            package = db.get(AddonPackage, payment.package_id) if payment.package_id else None
+            if not package or not current:
+                return None
+            addon_bytes = payment.package_traffic_bytes or int(package.traffic_gb * (1024 ** 3))
+            # Unlimited users stay unlimited; for limited users, extend the cap without resetting used traffic.
+            new_limit = 0 if current.traffic_limit_bytes == 0 else current.traffic_limit_bytes + addon_bytes
+            try:
+                inbound_ids = [int(value) for value in current.inbound_ids.split(",") if value.isdigit()]
+            except ValueError:
+                inbound_ids = []
+            await XUIClient().add_or_update_client(
+                telegram_id, current.sub_id, int(current.expires_at.replace(tzinfo=timezone.utc).timestamp() * 1000),
+                new_limit, exists=True, limit_hwid=current.limit_hwid, traffic_reset=current.traffic_reset,
+                inbound_ids=inbound_ids or None, enabled=current.enabled)
+            current.traffic_limit_bytes = new_limit
+            db.add(ProcessedPayment(payment_hash=invoice_hash))
+            db.delete(payment)
+            db.commit()
+            return telegram_id, ""
+        plan = db.get(Plan, plan_id)
+        if not plan:
+            return None
         now = datetime.now(timezone.utc)
         current_exp = current.expires_at.replace(tzinfo=timezone.utc) if current and current.expires_at.tzinfo is None else (current.expires_at if current else now)
         starts_at = max(now, current_exp)
@@ -144,10 +242,13 @@ async def provision_paid_invoice(invoice_id: str) -> tuple[int, str] | str | Non
         sub_id = current.sub_id if current else uuid.uuid4().hex[:20]
         plan_bytes = int(plan.traffic_limit_gb * (1024 ** 3))
         new_traffic_limit = plan_bytes
+        configured_inbounds = XUIClient._inbound_ids(get_config_map())
         await XUIClient().add_or_update_client(telegram_id, sub_id, int(expires.timestamp() * 1000),
-                                               new_traffic_limit, exists=current is not None)
+                                               new_traffic_limit, exists=current is not None,
+                                               limit_hwid=plan.limit_hwid, traffic_reset=plan.traffic_reset,
+                                               inbound_ids=configured_inbounds)
         if current:
-            await XUIClient().reset_client_traffic(sub_id)
+            await XUIClient().reset_client_traffic(sub_id, telegram_id)
         if current:
             current.expires_at = expires
             current.plan_id = plan.id
@@ -157,11 +258,16 @@ async def provision_paid_invoice(invoice_id: str) -> tuple[int, str] | str | Non
             current.current_price = plan.amount
             current.currency = plan.currency
             current.traffic_limit_bytes = new_traffic_limit
+            current.limit_hwid = plan.limit_hwid
+            current.traffic_reset = plan.traffic_reset
+            current.inbound_ids = ",".join(str(value) for value in configured_inbounds)
         else:
             db.add(Subscription(telegram_id=telegram_id, sub_id=sub_id, expires_at=expires, enabled=True,
                                 plan_id=plan.id,
                                 plan_name=plan.name, current_price=plan.amount, currency=plan.currency,
-                                traffic_limit_bytes=new_traffic_limit))
+                                traffic_limit_bytes=new_traffic_limit, limit_hwid=plan.limit_hwid,
+                                traffic_reset=plan.traffic_reset,
+                                inbound_ids=",".join(str(value) for value in configured_inbounds)))
         db.add(SubscriptionHistory(telegram_id=telegram_id, plan_name=plan.name, plan_days=plan.days,
                                    price=plan.amount, currency=plan.currency, traffic_limit_bytes=plan_bytes,
                                    starts_at=starts_at.replace(tzinfo=None), expires_at=expires.replace(tzinfo=None)))

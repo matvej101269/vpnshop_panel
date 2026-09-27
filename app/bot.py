@@ -1,18 +1,59 @@
 import asyncio
 import ipaddress
 import logging
+from datetime import datetime, timezone
+from typing import AsyncGenerator, Optional
 from aiogram import Bot, Dispatcher, F
+from aiogram.dispatcher.dispatcher import DEFAULT_BACKOFF_CONFIG
 from aiogram.filters import CommandStart
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.exceptions import TelegramNetworkError, TelegramServerError, TelegramUnauthorizedError
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Update
+from aiogram.methods import GetUpdates
+from aiogram.exceptions import (TelegramNetworkError, TelegramServerError, TelegramUnauthorizedError,
+                                TelegramConflictError, TelegramBadRequest)
+from aiogram.utils.backoff import Backoff, BackoffConfig
 from urllib.parse import urlsplit
 from sqlalchemy import select
-from app.db import SessionLocal, Plan, PendingPayment, BotMenuNode
-from app.services import LavaClient
+from app.db import SessionLocal, Plan, AddonPackage, PendingPayment, BotMenuNode, Subscription
+from app.services import LavaClient, XUIClient
 from app.runtime_config import get_config
 
-dp = Dispatcher()
 logger = logging.getLogger(__name__)
+
+
+class SinglePollDispatcher(Dispatcher):
+    @classmethod
+    async def _listen_updates(cls, bot: Bot, polling_timeout: int = 30,
+                              backoff_config: BackoffConfig = DEFAULT_BACKOFF_CONFIG,
+                              allowed_updates: Optional[list[str]] = None) -> AsyncGenerator[Update, None]:
+        backoff = Backoff(config=backoff_config)
+        get_updates = GetUpdates(timeout=polling_timeout, allowed_updates=allowed_updates)
+        kwargs = {}
+        if bot.session.timeout:
+            kwargs["request_timeout"] = int(bot.session.timeout + polling_timeout)
+        failed = False
+        while True:
+            try:
+                updates = await bot(get_updates, **kwargs)
+            except TelegramConflictError:
+                logger.error("Telegram polling conflict: stop this instance; another process is polling the same bot token")
+                raise
+            except TelegramUnauthorizedError:
+                logger.error("Telegram rejected the bot token; update it in admin settings")
+                raise
+            except Exception as exc:
+                failed = True
+                logger.error("Telegram update polling failed: %s: %s", type(exc).__name__, exc)
+                await backoff.asleep()
+                continue
+            if failed:
+                backoff.reset()
+                failed = False
+            for update in updates:
+                yield update
+                get_updates.offset = update.update_id + 1
+
+
+dp = SinglePollDispatcher()
 
 
 def is_public_http_url(value: str) -> bool:
@@ -57,17 +98,54 @@ async def show_menu(target, parent_id: int | None):
                 await target.message.answer("Это меню больше недоступно.")
                 return
             text = node.text or node.label
-            if node.action == "plans":
-                plans = db.scalars(select(Plan).where(Plan.enabled.is_(True))).all()
+            if node.action in {"plans", "change_plan"}:
+                plans = db.scalars(select(Plan).where(Plan.enabled.is_(True), Plan.show_in_bot.is_(True))).all()
                 rows = [[InlineKeyboardButton(text=f"{p.name} — {p.amount} {p.currency}", callback_data=f"buy:{p.id}")]
                         for p in plans]
                 rows.append([InlineKeyboardButton(text="‹ Назад", callback_data=f"menu:{node.parent_id or 0}")])
                 keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
                 text = node.text or "Выберите период VPN-подписки:"
+            elif node.action == "subscription_info":
+                sub = db.get(Subscription, target.from_user.id)
+                if not sub:
+                    text = "У вас пока нет активной подписки."
+                    keyboard = menu_keyboard(db, node.id)
+                else:
+                    try:
+                        used = await XUIClient().client_usage(sub.sub_id, sub.telegram_id)
+                    except Exception:
+                        used = None
+                    until = sub.expires_at.strftime("%d.%m.%Y %H:%M UTC")
+                    usage = (f"Использовано {used / (1024 ** 3):.2f} ГБ из {sub.traffic_limit_bytes / (1024 ** 3):.2f} ГБ"
+                             if used is not None and sub.traffic_limit_bytes else
+                             f"Использовано {used / (1024 ** 3):.2f} ГБ · без ограничений" if used is not None else
+                             "Не удалось получить данные из 3x-ui")
+                    text = f"Подписка: {sub.plan_name or 'VPN'}\nДействует до: {until}\nТрафик: {usage}"
+                    keyboard = menu_keyboard(db, node.id)
+            elif node.action == "addons":
+                sub = db.get(Subscription, target.from_user.id)
+                expires = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
+                packages = db.scalars(select(AddonPackage).where(AddonPackage.enabled.is_(True))).all() if sub and sub.enabled and sub.traffic_limit_bytes and expires and expires > datetime.now(timezone.utc) else []
+                rows = [[InlineKeyboardButton(text=f"{pkg.name} · {pkg.traffic_gb:g} ГБ — {pkg.amount} {pkg.currency}",
+                                              callback_data=f"addon:{pkg.id}")] for pkg in packages]
+                back_keyboard = menu_keyboard(db, node.id)
+                rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
+                keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+                text = node.text or ("Выберите пакет дополнительного трафика:" if packages else
+                                     "Пакеты доступны только для подписок с ограниченным трафиком.")
+            elif node.action == "offer":
+                text = node.text or "Ознакомьтесь с текстом оферты на странице по кнопке ниже."
+                rows = []
+                base = get_config("public_base_url").rstrip("/")
+                if is_public_http_url(base):
+                    rows.append([InlineKeyboardButton(text="Открыть оферту", url=f"{base}/offer")])
+                back_keyboard = menu_keyboard(db, node.id)
+                rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
+                keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
             else:
                 keyboard = menu_keyboard(db, node.id)
         if parent_id is None and not keyboard:
-            plans = db.scalars(select(Plan).where(Plan.enabled.is_(True))).all()
+            plans = db.scalars(select(Plan).where(Plan.enabled.is_(True), Plan.show_in_bot.is_(True))).all()
             rows = [[InlineKeyboardButton(text=f"{p.name} — {p.amount} {p.currency}", callback_data=f"buy:{p.id}")]
                     for p in plans]
             base = get_config("public_base_url").rstrip("/")
@@ -77,7 +155,11 @@ async def show_menu(target, parent_id: int | None):
     if isinstance(target, Message):
         await target.answer(text, reply_markup=keyboard)
     else:
-        await target.message.answer(text, reply_markup=keyboard)
+        try:
+            await target.message.edit_text(text, reply_markup=keyboard)
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.warning("Cannot update Telegram menu message: %s", exc)
 
 
 @dp.message(CommandStart())
@@ -99,15 +181,39 @@ async def buy(callback: CallbackQuery):
     try:
         with SessionLocal() as db:
             plan = db.get(Plan, plan_id)
-            if not plan or not plan.enabled:
+            if not plan or not plan.enabled or not plan.show_in_bot:
                 await callback.answer("Тариф недоступен", show_alert=True)
                 return
         invoice_id, pay_url = await LavaClient().create_invoice(callback.from_user.id, plan)
         with SessionLocal() as db:
-            db.add(PendingPayment(invoice_id=invoice_id, telegram_id=callback.from_user.id, plan_id=plan_id))
+            db.add(PendingPayment(invoice_id=invoice_id, telegram_id=callback.from_user.id,
+                                  plan_id=plan_id, product_type="plan"))
             db.commit()
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Оплатить", url=pay_url)]])
         await callback.message.answer("Счёт создан. После подтверждения оплаты бот пришлёт ссылку для Happ.", reply_markup=keyboard)
+        await callback.answer()
+    except Exception:
+        await callback.answer("Не удалось создать счёт. Попробуйте позже.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("addon:"))
+async def buy_addon(callback: CallbackQuery):
+    try:
+        package_id = int(callback.data.split(":", 1)[1])
+        with SessionLocal() as db:
+            package = db.get(AddonPackage, package_id)
+            sub = db.get(Subscription, callback.from_user.id)
+            expires = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
+            if not package or not package.enabled or not sub or not sub.enabled or not expires or expires <= datetime.now(timezone.utc) or not sub.traffic_limit_bytes:
+                await callback.answer("Пакет сейчас недоступен.", show_alert=True)
+                return
+            invoice_id, pay_url = await LavaClient().create_invoice(callback.from_user.id, package)
+            db.add(PendingPayment(invoice_id=invoice_id, telegram_id=callback.from_user.id,
+                                  plan_id=0, package_id=package.id, product_type="addon",
+                                  package_traffic_bytes=int(package.traffic_gb * (1024 ** 3))))
+            db.commit()
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Оплатить", url=pay_url)]])
+        await callback.message.answer("Счёт на дополнительный трафик создан.", reply_markup=keyboard)
         await callback.answer()
     except Exception:
         await callback.answer("Не удалось создать счёт. Попробуйте позже.", show_alert=True)
@@ -125,6 +231,9 @@ async def start_bot(token: str):
             logger.warning("Telegram connection failed; retrying in %s seconds: %s", delay, exc)
         except TelegramUnauthorizedError:
             logger.error("Telegram rejected the bot token; update it in admin settings")
+            return
+        except TelegramConflictError:
+            logger.error("Telegram bot polling conflict: another process is using this token; this instance will stop")
             return
         finally:
             await bot.session.close()

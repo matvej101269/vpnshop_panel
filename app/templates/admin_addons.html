@@ -1,0 +1,12 @@
+<div class="title-row"><div><h1>Дополнительные пакеты</h1><div class="subtitle">Оплачиваемые добавки трафика для действующих подписок</div></div></div>
+<section class="section"><div class="section-head"><div><h2>Новый пакет</h2><p>После оплаты лимит в 3x-ui увеличивается, текущий расход трафика сохраняется.</p></div></div>
+<form method="post" action="/admin/addons" class="form-panel"><div class="package-fields">
+<label>Название<input name="name" maxlength="100" placeholder="Дополнительные 50 ГБ" required></label>
+<label>Трафик, ГБ<input name="traffic_gb" type="number" min="0.1" step="0.1" required></label>
+<label>Цена<input name="amount" type="number" min="1" required></label>
+<label>Валюта<input name="currency" maxlength="8" value="RUB"></label>
+</div><button>Добавить пакет</button></form></section>
+<section class="section"><div class="section-head"><div><h2>Пакеты</h2><p>Их выводит действие «Увеличение лимита трафика» в конструкторе бота.</p></div></div><div class="table-wrap"><table><thead><tr><th>НАЗВАНИЕ</th><th>ТРАФИК, ГБ</th><th>ЦЕНА</th><th>ВАЛЮТА</th><th>ВКЛЮЧЁН</th><th></th></tr></thead><tbody>
+{% for pkg in packages %}{% set form_id = 'addon-' ~ pkg.id %}<tr><td><form id="{{form_id}}" method="post" action="/admin/addons/{{pkg.id}}/edit"></form><input form="{{form_id}}" name="name" value="{{pkg.name}}" required></td><td><input form="{{form_id}}" name="traffic_gb" type="number" min="0.1" step="0.1" value="{{pkg.traffic_gb}}" style="width:100px"></td><td><input form="{{form_id}}" name="amount" type="number" min="1" value="{{pkg.amount}}" style="width:90px"></td><td><input form="{{form_id}}" name="currency" value="{{pkg.currency}}" style="width:70px"></td><td><input form="{{form_id}}" type="checkbox" name="enabled" {{'checked' if pkg.enabled else ''}}></td><td><div class="actions"><button form="{{form_id}}" class="btn-quiet">Сохранить</button><form method="post" action="/admin/addons/{{pkg.id}}/delete" onsubmit="return confirm('Удалить пакет?')"><button class="btn-danger">Удалить</button></form></div></td></tr>{% else %}<tr><td colspan="6" class="empty">Пакетов пока нет</td></tr>{% endfor %}
+</tbody></table></div></section>
+<style>.package-fields{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:14px;margin-bottom:16px}.package-fields label{display:flex;flex-direction:column;gap:6px;color:#bac4d0;font-size:12px}.package-fields input{width:100%}.actions form{display:inline}@media(max-width:850px){.package-fields{grid-template-columns:1fr 1fr}}</style>

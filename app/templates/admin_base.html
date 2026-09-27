@@ -11,6 +11,7 @@
 <a class="{{ 'active' if section=='overview' else '' }}" href="/admin/overview"><span class="ico">▦</span><span>Обзор</span></a>
 <a class="{{ 'active' if section=='users' else '' }}" href="/admin/users"><span class="ico">◉</span><span>Пользователи</span></a>
 <a class="{{ 'active' if section=='subscriptions' else '' }}" href="/admin/subscriptions"><span class="ico">◇</span><span>Подписки и тарифы</span></a>
+<a class="{{ 'active' if section=='addons' else '' }}" href="/admin/addons"><span class="ico">＋</span><span>Дополнительные пакеты</span></a>
 <a class="{{ 'active' if section=='history' else '' }}" href="/admin/history"><span class="ico">◷</span><span>История подписок</span></a>
 <a class="{{ 'active' if section=='botmenu' else '' }}" href="/admin/botmenu"><span class="ico">☷</span><span>Конструктор бота</span></a>
 <a class="{{ 'active' if section=='settings' else '' }}" href="/admin/settings"><span class="ico">⚙</span><span>Настройки</span></a>
@@ -21,4 +22,5 @@
 document.querySelectorAll('th[data-sort]').forEach(th=>th.addEventListener('click',()=>{const table=th.closest('table'),idx=[...th.parentElement.children].indexOf(th),body=table.tBodies[0],rows=[...body.rows],asc=th.dataset.order!=='asc';rows.sort((a,b)=>{const x=a.cells[idx]?.dataset.sort??a.cells[idx]?.innerText??'',y=b.cells[idx]?.dataset.sort??b.cells[idx]?.innerText??'';const nx=Number(x),ny=Number(y);return (Number.isNaN(nx)?x.localeCompare(y,'ru'):nx-ny)*(asc?1:-1)});rows.forEach(r=>body.appendChild(r));th.dataset.order=asc?'asc':'desc'}));
 document.querySelectorAll('[data-select-all]').forEach(c=>c.addEventListener('change',()=>document.querySelectorAll('.user-select').forEach(x=>x.checked=c.checked)));
 const csrfValue=document.querySelector('meta[name="csrf-token"]').content;document.querySelectorAll('form[method="post"]').forEach(f=>{const i=document.createElement('input');i.type='hidden';i.name='csrf_token';i.value=csrfValue;f.appendChild(i)});
+document.querySelectorAll('.reveal-secret').forEach(button=>button.addEventListener('click',async()=>{const input=button.parentElement.querySelector('[data-secret-key]');if(!input)return;if(input.type==='text'){input.type='password';button.textContent='◉';return}if(!input.value&&input.dataset.loaded!=='true'){button.disabled=true;try{const r=await fetch('/admin/api/secrets/'+encodeURIComponent(input.dataset.secretKey));if(!r.ok)throw new Error();const data=await r.json();input.value=data.value||'';input.dataset.loaded='true'}catch{button.title='Не удалось получить секрет'}finally{button.disabled=false}}input.type='text';button.textContent='◎'}));
 </script></body></html>
