@@ -1,0 +1,24 @@
+<div class="title-row"><div><h1>Промокоды и реферальная программа</h1><div class="subtitle">Управление скидками и начислениями без хранения имён и контактов пользователей</div></div></div>
+
+<section class="section"><div class="section-head"><div><h2>Промокоды на скидку</h2><p>Срок отсчитывается с момента создания. Истёкший код сразу перестаёт приниматься ботом.</p></div></div>
+<form method="post" action="/admin/referrals/promos" class="form-panel promo-form">
+<label>Промокод<input name="code" maxlength="40" minlength="3" pattern="[A-Za-z0-9_-]{3,40}" placeholder="Например, SUMMER20" required></label>
+<label>Скидка, %<input type="number" name="discount_percent" min="1" max="100" required></label>
+<label>Срок действия, дней<input type="number" name="days_valid" min="1" max="3650" required></label>
+<label>Тарифы<select name="plan_ids" multiple size="4" required>{% for plan in promo_plans %}<option value="{{plan.id}}">{{plan.name}} · {{plan.amount}} {{plan.currency}}</option>{% endfor %}</select><small>Чтобы выбрать несколько тарифов, удерживайте Ctrl.</small></label>
+<button type="submit">Создать промокод</button>
+</form>
+{% if promo_rows %}<div class="table-wrap"><table><thead><tr><th>Промокод</th><th>Скидка</th><th>Тарифы</th><th>Истекает</th><th>Осталось</th><th>Использован</th><th></th></tr></thead><tbody>
+{% for row in promo_rows %}<tr><td><b>{{row.promo.code}}</b>{% if row.expired %} <span class="pill off">Истёк</span>{% endif %}</td><td>{{row.promo.discount_percent}}%</td><td>{{row.plans|join(', ') or '—'}}</td><td>{{row.promo.expires_at.strftime('%d.%m.%Y %H:%M UTC')}}</td><td>{{row.remaining}}</td><td>{{row.used}}</td><td><form method="post" action="/admin/referrals/promos/{{row.promo.id}}/delete" onsubmit="return confirm('Удалить промокод {{row.promo.code}}?')"><button class="btn-danger">Удалить</button></form></td></tr>{% endfor %}
+</tbody></table></div>{% else %}<div class="empty">Промокодов пока нет.</div>{% endif %}</section>
+
+<section class="section"><div class="section-head"><div><h2>Реферальная программа</h2><p>Приглашённый закрепляется за первым пригласившим при первом запуске бота по его ссылке. Привязка бессрочная. Дни начисляются после каждой успешной оплаты выбранного тарифа.</p></div></div>
+<form method="post" action="/admin/referrals/settings" class="form-panel">
+<label class="switch-line"><input type="checkbox" name="enabled" {{'checked' if referral_enabled else ''}}> Включить программу и ссылки приглашения</label>
+<div class="table-wrap"><table><thead><tr><th>Тариф оплаченной подписки</th><th>Дней пригласившему за каждую оплату</th></tr></thead><tbody>
+{% for plan in referral_plans %}<tr><td>{{plan.name}} · {{plan.amount}} {{plan.currency}}</td><td><input type="number" name="days_{{plan.id}}" min="0" max="3650" value="{{referral_rewards.get(plan.id, 0)}}"><span class="mini">0 — не начислять</span></td></tr>{% else %}<tr><td colspan="2">Сначала создайте тариф.</td></tr>{% endfor %}
+</tbody></table></div>
+<div class="form-panel"><p class="mini">Начисленные дни продлевают текущую подписку пригласившего. Если у него ещё нет подписки, создаётся доступ на число бонусных дней с параметрами оплаченного тарифа. Бот хранит только Telegram ID для бессрочной привязки.</p><button type="submit">Сохранить настройки рефералов</button></div>
+</form></section>
+
+<style>.promo-form{display:grid;grid-template-columns:1fr .7fr .8fr 1.5fr auto;gap:11px;align-items:end}.promo-form>label{display:flex;flex-direction:column;gap:7px;color:#bac4d0;font-size:12px}.promo-form select{min-height:104px}.promo-form small{color:var(--muted)}.switch-line{display:flex;align-items:center;gap:9px;padding-bottom:14px;color:#d4dbe4}.switch-line input{accent-color:var(--blue)}td input[type=number]{width:110px;margin-right:9px}.section .table-wrap+ .empty{padding:18px}@media(max-width:900px){.promo-form{grid-template-columns:1fr 1fr}.promo-form>label:nth-child(4){grid-column:span 2}}@media(max-width:600px){.promo-form{grid-template-columns:1fr}.promo-form>label:nth-child(4){grid-column:auto}}</style>

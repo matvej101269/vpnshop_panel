@@ -40,6 +40,7 @@ CONFIG_DEFAULTS = {
     "timezone": env_settings.timezone,
     "bot_welcome_text": "Выберите период VPN-подписки:",
     "offer_text": "Укажите здесь текст договора оферты.",
+    "referral_enabled": "false",
 }
 SECRET_KEYS = {"bot_token", "lava_api_key", "lava_offer_id", "lava_webhook_key", "xui_username", "xui_password", "xui_api_token"}
 DEFAULT_LABELS = {

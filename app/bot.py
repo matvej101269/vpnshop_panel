@@ -1,8 +1,11 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import ipaddress
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Optional
@@ -18,11 +21,13 @@ from urllib.parse import quote, urlsplit
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from app.db import (SessionLocal, Plan, AddonPackage, PendingPayment, BotMenuNode,
-                    Subscription, SubscriptionHistory, TrialClaim)
+                    Subscription, SubscriptionHistory, TrialClaim, PromoCode, PromoPrompt,
+                    PromoSelection, PromoRedemption, ReferralAttribution, ReferralReward)
 from app.services import LavaClient, XUIClient, happ_link, quote_immediate_switch, provision_paid_invoice
 from app.runtime_config import get_config, get_config_map, encrypt_handoff
 
 logger = logging.getLogger(__name__)
+BOT_USERNAME = ""
 
 
 def _trial_already_used(db, telegram_id: int) -> bool:
@@ -113,27 +118,34 @@ def menu_keyboard(db, parent_id: int | None, include_back: bool = True, telegram
         BotMenuNode.parent_id == parent_id, BotMenuNode.enabled.is_(True)
     ).order_by(BotMenuNode.position, BotMenuNode.id)).all()
     rows = []
+    def add_button(node, button):
+        if node.same_row and rows and len(rows[-1]) < 2:
+            rows[-1].append(button)
+        else:
+            rows.append([button])
     for node in nodes:
         if node.action == "url":
-            rows.append([InlineKeyboardButton(text=node.label, url=node.url)])
+            add_button(node, InlineKeyboardButton(text=node.label, url=node.url))
         elif node.action == "trial":
             if telegram_id is not None and not _trial_already_used(db, telegram_id):
-                rows.append([InlineKeyboardButton(text=node.label, callback_data=f"trial:{node.id}")])
+                add_button(node, InlineKeyboardButton(text=node.label, callback_data=f"trial:{node.id}"))
         elif node.action == "routing" and node.routing_rules:
             # Route actions need a callback first: it associates the profile with
             # the user's active subscription before generating its Happ URL.
-            rows.append([InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}")])
+            add_button(node, InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}"))
         elif node.action == "open_happ" and telegram_id is not None:
             sub = db.get(Subscription, telegram_id)
             expiry = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
             link = happ_link(sub.sub_id) if sub and sub.enabled and expiry and expiry > datetime.now(timezone.utc) else ""
             deep_link = happ_bridge_url(f"happ://add/{link}") if link.startswith(("http://", "https://")) else ""
             if deep_link and len(deep_link) <= 4096:
-                rows.append([InlineKeyboardButton(text=node.label, url=deep_link)])
+                add_button(node, InlineKeyboardButton(text=node.label, url=deep_link))
             else:
-                rows.append([InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}")])
+                add_button(node, InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}"))
+        elif node.action in {"promo", "referral"}:
+            add_button(node, InlineKeyboardButton(text=node.label, callback_data=f"action:{node.id}"))
         else:
-            rows.append([InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}")])
+            add_button(node, InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}"))
     if parent_id is None and telegram_id is not None:
         configured_trial = db.scalar(select(BotMenuNode.id).where(
             BotMenuNode.action == "trial", BotMenuNode.enabled.is_(True)).limit(1))
@@ -258,7 +270,93 @@ async def show_menu(target, parent_id: int | None):
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    pieces = (message.text or "").split(maxsplit=1)
+    payload = pieces[1].strip() if len(pieces) > 1 else ""
+    user_id = message.from_user.id
+    referral = re.fullmatch(r"ref_([0-9]{1,20})_([A-Za-z0-9_-]{8})", payload)
+    if referral and get_config("referral_enabled").lower() in {"1", "true", "yes", "on"}:
+        referrer_id = int(referral.group(1))
+        expected = base64.urlsafe_b64encode(hmac.new(
+            get_config("bot_token").encode(), str(referrer_id).encode(), hashlib.sha256).digest()[:6]
+        ).decode().rstrip("=")
+        with SessionLocal() as db:
+            if (referrer_id != user_id and hmac.compare_digest(referral.group(2), expected)
+                    and not _trial_already_used(db, user_id)
+                    and not db.get(ReferralAttribution, user_id)):
+                db.add(ReferralAttribution(referred_id=user_id, referrer_id=referrer_id))
+                db.commit()
     await show_menu(message, None)
+
+
+@dp.callback_query(F.data.startswith("action:"))
+async def menu_action(callback: CallbackQuery):
+    raw_id = callback.data.split(":", 1)[1]
+    with SessionLocal() as db:
+        node = db.get(BotMenuNode, int(raw_id)) if raw_id.isdigit() else None
+        if not node or not node.enabled or node.action not in {"promo", "referral"}:
+            await callback.answer("Действие недоступно.", show_alert=True)
+            return
+        if node.action == "promo":
+            expiry = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=10)
+            prompt = db.get(PromoPrompt, callback.from_user.id)
+            if prompt:
+                prompt.expires_at = expiry
+            else:
+                db.add(PromoPrompt(telegram_id=callback.from_user.id, expires_at=expiry))
+            db.commit()
+            text = "Отправьте промокод одним сообщением. Запрос действует 10 минут."
+        else:
+            if not get_config("referral_enabled").lower() in {"1", "true", "yes", "on"}:
+                await callback.answer("Реферальная программа сейчас выключена.", show_alert=True)
+                return
+            if not BOT_USERNAME:
+                await callback.answer("Ссылка временно недоступна.", show_alert=True)
+                return
+            referral_signature = base64.urlsafe_b64encode(hmac.new(
+                get_config("bot_token").encode(), str(callback.from_user.id).encode(), hashlib.sha256
+            ).digest()[:6]).decode().rstrip("=")
+            text = (f"Ваша реферальная ссылка:\nhttps://t.me/{BOT_USERNAME}?start="
+                    f"ref_{callback.from_user.id}_{referral_signature}")
+    await callback.message.answer(text)
+    await callback.answer()
+
+
+@dp.message(F.text, ~F.text.startswith("/"))
+async def accept_promo_code(message: Message):
+    user_id = message.from_user.id
+    with SessionLocal() as db:
+        prompt = db.get(PromoPrompt, user_id)
+        if not prompt:
+            return
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.delete(prompt)
+        if prompt.expires_at <= now:
+            db.commit()
+            await message.answer("Время ввода истекло. Нажмите кнопку промокода ещё раз.")
+            return
+        code = (message.text or "").strip().upper()
+        promo = db.scalar(select(PromoCode).where(PromoCode.code == code))
+        expires = promo.expires_at.replace(tzinfo=None) if promo and promo.expires_at.tzinfo else (promo.expires_at if promo else None)
+        if not promo or not expires or expires <= now:
+            db.commit()
+            await message.answer("Промокод не найден или срок его действия истёк.")
+            return
+        if db.get(PromoRedemption, (promo.id, user_id)):
+            db.commit()
+            await message.answer("Вы уже использовали этот промокод.")
+            return
+        selection = db.get(PromoSelection, user_id)
+        if selection:
+            selection.promo_id = promo.id
+            selection.selected_at = now
+        else:
+            db.add(PromoSelection(telegram_id=user_id, promo_id=promo.id, selected_at=now))
+        db.commit()
+        eligible = [int(value) for value in promo.plan_ids.split(",") if value.isdigit()]
+        plans = db.scalars(select(Plan).where(Plan.id.in_(eligible), Plan.enabled.is_(True),
+                                             Plan.show_in_bot.is_(True))).all() if eligible else []
+        names = ", ".join(plan.name for plan in plans) or "настроенные тарифы"
+    await message.answer(f"Промокод принят: скидка {promo.discount_percent}%. Доступен для: {names}. Теперь выберите тариф.")
 
 
 @dp.callback_query(F.data.startswith("menu:"))
@@ -384,19 +482,49 @@ async def create_plan_order(callback: CallbackQuery, immediate_switch: bool):
                 await callback.answer("У вас уже есть неоплаченная смена тарифа. Завершите оплату или дождитесь отмены счёта.", show_alert=True)
                 return
             charge, credit, service_days = quote_immediate_switch(db, callback.from_user.id, plan) if switch_now else (plan.amount, 0, plan.days)
+            promo_id, promo_percent, promo_code = None, 0, ""
+            selection = db.get(PromoSelection, callback.from_user.id)
+            if selection:
+                promo = db.get(PromoCode, selection.promo_id)
+                promo_expiry = (promo.expires_at.replace(tzinfo=timezone.utc) if promo and promo.expires_at.tzinfo is None
+                                else (promo.expires_at if promo else None))
+                eligible_ids = [int(v) for v in promo.plan_ids.split(",") if v.isdigit()] if promo else []
+                if not promo or not promo_expiry or promo_expiry <= datetime.now(timezone.utc):
+                    await callback.answer("Промокод истёк. Введите действующий код заново.", show_alert=True)
+                    return
+                if plan.id not in eligible_ids:
+                    await callback.answer("Промокод не действует на этот тариф.", show_alert=True)
+                    return
+                if db.get(PromoRedemption, (promo.id, callback.from_user.id)):
+                    db.delete(selection)
+                    db.commit()
+                    await callback.answer("Вы уже использовали этот промокод.", show_alert=True)
+                    return
+                if db.scalar(select(PendingPayment.invoice_id).where(
+                    PendingPayment.telegram_id == callback.from_user.id,
+                    PendingPayment.promo_code_id == promo.id
+                )):
+                    await callback.answer("У вас уже есть счёт с этим промокодом.", show_alert=True)
+                    return
+                promo_id, promo_percent, promo_code = promo.id, promo.discount_percent, promo.code
+                charge = (charge * (100 - promo_percent) + 99) // 100
             snapshot = {"plan_name_snapshot": plan.name, "plan_amount_snapshot": plan.amount,
                         "plan_currency_snapshot": plan.currency, "plan_days_snapshot": plan.days,
                         "plan_traffic_gb_snapshot": plan.traffic_limit_gb,
-                        "plan_hwid_snapshot": plan.limit_hwid, "plan_reset_snapshot": plan.traffic_reset}
-        if switch_now and charge == 0:
+                        "plan_hwid_snapshot": plan.limit_hwid, "plan_reset_snapshot": plan.traffic_reset,
+                        "promo_code_id": promo_id, "promo_percent_snapshot": promo_percent,
+                        "promo_code_snapshot": promo_code}
+        if charge == 0:
             invoice_id = "credit-" + uuid.uuid4().hex
             with SessionLocal() as db:
                 db.add(PendingPayment(invoice_id=invoice_id, telegram_id=callback.from_user.id, plan_id=plan_id,
-                                      product_type="plan", charged_amount=0, credit_amount=credit, immediate_switch=True,
-                                      switch_days=service_days, **snapshot))
+                                      product_type="plan", charged_amount=0, credit_amount=credit,
+                                      immediate_switch=switch_now, switch_days=service_days if switch_now else 0,
+                                      **snapshot))
                 db.commit()
             result = await provision_paid_invoice(invoice_id)
-            await callback.message.answer(f"Тариф изменён сразу. Остаток зачтён; новый срок — {service_days} дн.")
+            await callback.message.answer(
+                f"Тариф активирован без оплаты. {('Скидка по промокоду ' + promo_code + ' составила 100%.') if promo_percent == 100 else f'Остаток зачтён; новый срок — {service_days} дн.'}")
             if isinstance(result, tuple) and result[1]:
                 bridge = happ_bridge_url(f"happ://add/{result[1]}")
                 if bridge:
@@ -416,6 +544,8 @@ async def create_plan_order(callback: CallbackQuery, immediate_switch: bool):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Оплатить", url=pay_url)]])
         description = (f"Смена тарифа сейчас. К оплате {charge} {plan.currency}; учтено остатка: {credit} {plan.currency}." if switch_now
                        else "Счёт создан. После подтверждения оплаты бот пришлёт ссылку для Happ.")
+        if promo_percent:
+            description = f"Промокод {promo_code}: скидка {promo_percent}%. К оплате {charge} {plan.currency}.\n" + description
         await callback.message.answer(description, reply_markup=keyboard)
         await callback.answer()
     except Exception:
@@ -446,11 +576,14 @@ async def buy_addon(callback: CallbackQuery):
 
 
 async def start_bot(token: str):
+    global BOT_USERNAME
     delay = 5
     while True:
         bot = Bot(token)
         try:
             logger.info("Connecting Telegram bot via long polling")
+            me = await bot.get_me()
+            BOT_USERNAME = me.username or ""
             await dp.start_polling(bot)
             logger.info("Telegram polling stopped")
             return

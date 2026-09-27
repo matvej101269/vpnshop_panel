@@ -7,8 +7,9 @@ import httpx
 from sqlalchemy import select
 from app.config import settings as env_settings
 from app.db import (SessionLocal, Plan, AddonPackage, AddonBalance, PendingPayment, Subscription,
-                    SubscriptionHistory, ProcessedPayment)
-from app.runtime_config import get_config_map
+                    SubscriptionHistory, ProcessedPayment, PromoRedemption, ReferralAttribution,
+                    ReferralReward, PromoSelection)
+from app.runtime_config import get_config, get_config_map
 
 
 class LavaClient:
@@ -519,10 +520,53 @@ async def provision_paid_invoice(invoice_id: str) -> tuple[int, str] | str | Non
                                 traffic_limit_bytes=new_traffic_limit, limit_hwid=plan_hwid,
                                 traffic_reset=plan_reset,
                                 inbound_ids=",".join(str(value) for value in configured_inbounds)))
-        history_value = (payment.charged_amount + payment.credit_amount) if immediate_switch else (payment.charged_amount or plan_amount)
+        history_value = payment.charged_amount + payment.credit_amount
         db.add(SubscriptionHistory(telegram_id=telegram_id, plan_name=plan_name, plan_days=service_days,
                                    price=history_value, currency=plan_currency, traffic_limit_bytes=plan_bytes,
                                    starts_at=starts_at.replace(tzinfo=None), expires_at=expires.replace(tzinfo=None)))
+        if payment.promo_code_id:
+            if not db.get(PromoRedemption, (payment.promo_code_id, telegram_id)):
+                db.add(PromoRedemption(promo_id=payment.promo_code_id, telegram_id=telegram_id,
+                                       invoice_hash=invoice_hash))
+            selection = db.get(PromoSelection, telegram_id)
+            if selection and selection.promo_id == payment.promo_code_id:
+                db.delete(selection)
+
+        attribution = db.get(ReferralAttribution, telegram_id)
+        reward = db.get(ReferralReward, plan.id)
+        if (attribution and reward and reward.days > 0 and
+                get_config("referral_enabled").lower() in {"1", "true", "yes", "on"}):
+            referrer_id = attribution.referrer_id
+            ref_sub = db.get(Subscription, referrer_id)
+            ref_exp = (ref_sub.expires_at.replace(tzinfo=timezone.utc) if ref_sub and ref_sub.expires_at.tzinfo is None
+                       else (ref_sub.expires_at if ref_sub else now))
+            reward_starts = max(now, ref_exp)
+            reward_expires = reward_starts + timedelta(days=reward.days)
+            ref_sub_id = ref_sub.sub_id if ref_sub else uuid.uuid4().hex[:20]
+            ref_inbounds = ([int(value) for value in ref_sub.inbound_ids.split(",") if value.isdigit()]
+                            if ref_sub and ref_sub.inbound_ids else configured_inbounds)
+            ref_plan_name = ref_sub.plan_name if ref_sub and ref_sub.plan_name else plan_name
+            ref_limit = ref_sub.traffic_limit_bytes if ref_sub else plan_bytes
+            ref_hwid = ref_sub.limit_hwid if ref_sub else plan_hwid
+            ref_reset = ref_sub.traffic_reset if ref_sub else plan_reset
+            await XUIClient().add_or_update_client(
+                referrer_id, ref_sub_id, int(reward_expires.timestamp() * 1000), ref_limit,
+                exists=ref_sub is not None, limit_hwid=ref_hwid, traffic_reset=ref_reset,
+                inbound_ids=ref_inbounds or configured_inbounds, enabled=True, group_name=ref_plan_name)
+            if ref_sub:
+                ref_sub.expires_at = reward_expires
+                ref_sub.enabled = True
+                ref_sub.reminded = ""
+            else:
+                db.add(Subscription(telegram_id=referrer_id, sub_id=ref_sub_id,
+                                    expires_at=reward_expires, plan_id=plan.id, plan_name=plan_name,
+                                    current_price=0, currency=plan_currency, traffic_limit_bytes=plan_bytes,
+                                    limit_hwid=plan_hwid, traffic_reset=plan_reset,
+                                    inbound_ids=",".join(str(value) for value in ref_inbounds), enabled=True))
+            db.add(SubscriptionHistory(telegram_id=referrer_id, plan_name=f"Реферальные дни · {plan_name}",
+                                       plan_days=reward.days, price=0, currency=plan_currency,
+                                       traffic_limit_bytes=ref_limit, starts_at=reward_starts.replace(tzinfo=None),
+                                       expires_at=reward_expires.replace(tzinfo=None)))
         db.add(ProcessedPayment(payment_hash=invoice_hash))
         db.delete(payment)
         db.commit()

@@ -22,7 +22,8 @@ from urllib.parse import unquote, urlsplit
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings as env_settings
 from app.db import (init_db, SessionLocal, Plan, AddonPackage, AddonBalance, TrialClaim, BotMenuNode, PendingPayment, FulfillmentJob, ProcessedPayment, Subscription,
-                    SubscriptionHistory, AdminAccount)
+                    SubscriptionHistory, AdminAccount, PromoCode, PromoSelection,
+                    PromoRedemption, ReferralReward)
 from app.services import (provision_paid_invoice, reconcile_addon_balances, XUIClient,
                           happ_link, upstream_happ_link)
 from app.backups import create_backup, backup_directory
@@ -37,7 +38,7 @@ templates = Jinja2Templates(directory="app/templates")
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler(timezone=env_settings.timezone)
 bot_task: asyncio.Task | None = None
-SECTIONS = {"overview", "users", "subscriptions", "addons", "history", "settings", "botmenu", "system"}
+SECTIONS = {"overview", "users", "subscriptions", "addons", "history", "settings", "botmenu", "referrals", "system"}
 SECRET_LABELS = {
     "bot_token": "name_bot_token", "lava_api_key": "name_lava_api_key", "lava_offer_id": "name_lava_offer_id",
     "lava_webhook_key": "name_lava_webhook_key", "xui_password": "name_xui_password",
@@ -605,6 +606,27 @@ async def admin_page(section: str, request: Request, _: None = Depends(admin)):
             walk(None)
             ctx.update(menu_rows=menu_rows, menu_labels=menu_labels, bot_welcome_text=get_config("bot_welcome_text"),
                        offer_text=get_config("offer_text"), public_base_url=get_config("public_base_url"))
+        elif section == "referrals":
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            plans = db.scalars(select(Plan).order_by(Plan.days, Plan.id)).all()
+            promo_plans = db.scalars(select(Plan).where(
+                Plan.enabled.is_(True), Plan.show_in_bot.is_(True)).order_by(Plan.days, Plan.id)).all()
+            rewards = {item.plan_id: item.days for item in db.scalars(select(ReferralReward)).all()}
+            promos = db.scalars(select(PromoCode).order_by(PromoCode.expires_at.desc())).all()
+            promo_rows = []
+            for promo in promos:
+                expires_at = promo.expires_at.replace(tzinfo=None) if promo.expires_at.tzinfo else promo.expires_at
+                seconds = max(0, int((expires_at - now).total_seconds()))
+                remaining = (f"{seconds // 86400} дн. {(seconds % 86400) // 3600:02d} ч. "
+                             f"{(seconds % 3600) // 60:02d} мин." if seconds else "Срок истёк")
+                used = db.scalar(select(func.count()).select_from(PromoRedemption).where(
+                    PromoRedemption.promo_id == promo.id)) or 0
+                promo_rows.append({"promo": promo, "remaining": remaining, "expired": seconds == 0,
+                                   "plans": [p.name for p in plans if p.id in [int(v) for v in promo.plan_ids.split(",") if v.isdigit()]],
+                                   "used": used})
+            ctx.update(referral_plans=plans, promo_plans=promo_plans,
+                       referral_rewards=rewards, promo_rows=promo_rows,
+                       referral_enabled=get_config("referral_enabled").lower() in {"1", "true", "yes", "on"})
         elif section == "system":
             backups = sorted(backup_directory().glob("vpnshop-*.vpbak"), key=lambda p: p.stat().st_mtime, reverse=True)
             sync_issues = db.scalars(select(Subscription).where(
@@ -629,7 +651,7 @@ def validate_menu_values(form, db, current_id: int | None = None):
     parent_raw = str(form.get("parent_id", "")).strip()
     if not label or len(label) > 64:
         raise HTTPException(status_code=400, detail="Название кнопки должно быть от 1 до 64 символов")
-    if action not in {"menu", "plans", "change_plan", "subscription_info", "addons", "offer", "url", "open_happ", "routing", "trial"}:
+    if action not in {"menu", "plans", "change_plan", "subscription_info", "addons", "offer", "url", "open_happ", "routing", "trial", "promo", "referral"}:
         raise HTTPException(status_code=400, detail="Неизвестное действие кнопки")
     parent_id = int(parent_raw) if parent_raw.isdigit() and int(parent_raw) > 0 else None
     if parent_id is not None:
@@ -679,6 +701,7 @@ def validate_menu_values(form, db, current_id: int | None = None):
     return {"parent_id": parent_id, "label": label, "action": action,
             "text": text_value[:4000], "url": url, "routing_rules": routing_rules,
             "position": position,
+            "same_row": str(form.get("same_row", "")) == "on",
             "enabled": str(form.get("enabled", "")) == "on"}
 
 
@@ -723,6 +746,76 @@ async def delete_bot_menu_node(node_id: int, request: Request, _: None = Depends
             db.delete(node)
             db.commit()
     return RedirectResponse("/admin/botmenu", status_code=303)
+
+
+@app.post("/admin/referrals/promos")
+async def create_promo_code(request: Request, _: None = Depends(admin)):
+    form = await checked_form(request)
+    code = str(form.get("code", "")).strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{3,40}", code):
+        raise HTTPException(status_code=400, detail="Код: от 3 до 40 латинских букв, цифр, дефиса или подчёркивания")
+    try:
+        discount = int(form.get("discount_percent", 0))
+        days = int(form.get("days_valid", 0))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Укажите корректную скидку и срок") from exc
+    plan_ids = sorted({int(value) for value in form.getlist("plan_ids") if str(value).isdigit()})
+    if not 1 <= discount <= 100 or not 1 <= days <= 3650 or not plan_ids:
+        raise HTTPException(status_code=400, detail="Выберите тарифы и укажите скидку 1–100% и срок 1–3650 дней")
+    with SessionLocal() as db:
+        valid_ids = set(db.scalars(select(Plan.id).where(
+            Plan.id.in_(plan_ids), Plan.enabled.is_(True), Plan.show_in_bot.is_(True))).all())
+        if valid_ids != set(plan_ids):
+            raise HTTPException(status_code=400, detail="В списке есть неизвестный тариф")
+        if db.scalar(select(PromoCode.id).where(PromoCode.code == code)):
+            raise HTTPException(status_code=409, detail="Такой промокод уже существует")
+        db.add(PromoCode(code=code, discount_percent=discount,
+                         plan_ids=",".join(map(str, plan_ids)),
+                         expires_at=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=days)))
+        db.commit()
+    return RedirectResponse("/admin/referrals", status_code=303)
+
+
+@app.post("/admin/referrals/promos/{promo_id}/delete")
+async def delete_promo_code(promo_id: int, request: Request, _: None = Depends(admin)):
+    await checked_form(request)
+    with SessionLocal() as db:
+        promo = db.get(PromoCode, promo_id)
+        if promo:
+            pending = db.scalar(select(PendingPayment.invoice_id).where(PendingPayment.promo_code_id == promo_id).limit(1))
+            if pending:
+                raise HTTPException(status_code=409, detail="Промокод привязан к неоплаченному счёту; повторите удаление после оплаты или истечения счёта")
+            db.query(PromoSelection).filter(PromoSelection.promo_id == promo_id).delete(synchronize_session=False)
+            db.query(PromoRedemption).filter(PromoRedemption.promo_id == promo_id).delete(synchronize_session=False)
+            db.delete(promo)
+            db.commit()
+    return RedirectResponse("/admin/referrals", status_code=303)
+
+
+@app.post("/admin/referrals/settings")
+async def save_referral_settings(request: Request, _: None = Depends(admin)):
+    form = await checked_form(request)
+    with SessionLocal() as db:
+        plans = db.scalars(select(Plan)).all()
+        for plan in plans:
+            raw = str(form.get(f"days_{plan.id}", "0")).strip()
+            try:
+                days = int(raw or 0)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"Некорректное число дней для тарифа {plan.name}") from exc
+            if not 0 <= days <= 3650:
+                raise HTTPException(status_code=400, detail="Число реферальных дней должно быть от 0 до 3650")
+            reward = db.get(ReferralReward, plan.id)
+            if days:
+                if reward:
+                    reward.days = days
+                else:
+                    db.add(ReferralReward(plan_id=plan.id, days=days))
+            elif reward:
+                db.delete(reward)
+        db.commit()
+    save_config({"referral_enabled": "true" if form.get("enabled") == "on" else "false"})
+    return RedirectResponse("/admin/referrals", status_code=303)
 
 
 @app.post("/admin/subscriptions")
@@ -962,6 +1055,17 @@ async def delete_plan(plan_id: int, request: Request, _: None = Depends(admin)):
         )).first()
         if users:
             raise HTTPException(status_code=409, detail="Нельзя удалить тариф, пока к нему привязаны пользователи")
+        if db.scalar(select(PendingPayment.invoice_id).where(PendingPayment.plan_id == plan_id).limit(1)):
+            raise HTTPException(status_code=409, detail="Нельзя удалить тариф, пока по нему ожидается оплата")
+        reward = db.get(ReferralReward, plan_id)
+        if reward:
+            db.delete(reward)
+        for promo in db.scalars(select(PromoCode)).all():
+            selected = [int(value) for value in promo.plan_ids.split(",") if value.isdigit() and int(value) != plan_id]
+            if len(selected) != len([value for value in promo.plan_ids.split(",") if value.isdigit()]):
+                promo.plan_ids = ",".join(map(str, selected))
+                if not selected:
+                    promo.expires_at = datetime.now(timezone.utc).replace(tzinfo=None)
         db.delete(plan)
         db.commit()
     return RedirectResponse("/admin/subscriptions", status_code=303)

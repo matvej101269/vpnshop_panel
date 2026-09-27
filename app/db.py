@@ -34,7 +34,52 @@ class BotMenuNode(Base):
     url: Mapped[str] = mapped_column(String(500), default="")
     routing_rules: Mapped[str] = mapped_column(Text, default="")
     position: Mapped[int] = mapped_column(Integer, default=0)
+    same_row: Mapped[bool] = mapped_column(Boolean, default=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class PromoCode(Base):
+    __tablename__ = "promo_codes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    discount_percent: Mapped[int] = mapped_column(Integer)
+    plan_ids: Mapped[str] = mapped_column(Text, default="")
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class PromoSelection(Base):
+    __tablename__ = "promo_selections"
+    telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    promo_id: Mapped[int] = mapped_column(Integer, index=True)
+    selected_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class PromoPrompt(Base):
+    __tablename__ = "promo_prompts"
+    telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class PromoRedemption(Base):
+    __tablename__ = "promo_redemptions"
+    promo_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    invoice_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    redeemed_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class ReferralAttribution(Base):
+    __tablename__ = "referral_attributions"
+    referred_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    referrer_id: Mapped[int] = mapped_column(Integer, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class ReferralReward(Base):
+    __tablename__ = "referral_rewards"
+    plan_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    days: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class AddonPackage(Base):
@@ -85,6 +130,9 @@ class PendingPayment(Base):
     plan_traffic_gb_snapshot: Mapped[float] = mapped_column(Float, default=0)
     plan_hwid_snapshot: Mapped[int] = mapped_column(Integer, default=0)
     plan_reset_snapshot: Mapped[str] = mapped_column(String(16), default="")
+    promo_code_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    promo_percent_snapshot: Mapped[int] = mapped_column(Integer, default=0)
+    promo_code_snapshot: Mapped[str] = mapped_column(String(40), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -188,7 +236,8 @@ def init_db():
     # Small in-place SQLite schema upgrade for databases created by earlier app revisions.
     if settings.database_url.startswith("sqlite"):
         upgrades = {
-            "bot_menu_nodes": {"routing_rules": "TEXT NOT NULL DEFAULT ''"},
+            "bot_menu_nodes": {"routing_rules": "TEXT NOT NULL DEFAULT ''",
+                               "same_row": "BOOLEAN NOT NULL DEFAULT 0"},
             "plans": {"traffic_limit_gb": "FLOAT NOT NULL DEFAULT 0",
                       "show_in_bot": "BOOLEAN NOT NULL DEFAULT 1",
                       "limit_hwid": "INTEGER NOT NULL DEFAULT 0",
@@ -208,6 +257,9 @@ def init_db():
                 "plan_traffic_gb_snapshot": "FLOAT NOT NULL DEFAULT 0",
                 "plan_hwid_snapshot": "INTEGER NOT NULL DEFAULT 0",
                 "plan_reset_snapshot": "VARCHAR(16) NOT NULL DEFAULT ''",
+                "promo_code_id": "INTEGER",
+                "promo_percent_snapshot": "INTEGER NOT NULL DEFAULT 0",
+                "promo_code_snapshot": "VARCHAR(40) NOT NULL DEFAULT ''",
             },
             "subscriptions": {
                 "plan_id": "INTEGER",
