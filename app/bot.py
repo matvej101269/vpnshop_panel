@@ -206,11 +206,11 @@ async def show_menu(target, parent_id: int | None):
                 expires = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
                 active = bool(sub and sub.enabled and expires and expires > datetime.now(timezone.utc))
                 if active and node.routing_rules:
-                    # A routed URL is created only after the user selects this
-                    # action. The regular subscription URL remains route-free.
-                    token = encrypt_handoff(node.routing_rules)
-                    link = f"{happ_link(sub.sub_id)}?routing={quote(token, safe='')}"
-                    route_link = happ_bridge_url(f"happ://add/{link}") if link.startswith("https://") else ""
+                    # Ask the HTTPS handoff page to stage a one-time routing
+                    # profile, then reopen the exact same subscription URL.
+                    handoff = json.dumps({"action": "apply_routing", "sub_id": sub.sub_id,
+                                          "rules": node.routing_rules}, ensure_ascii=False)
+                    route_link = happ_bridge_url(handoff)
                 else:
                     route_link = ""
                 rows = [[InlineKeyboardButton(text="Применить правила к подписке в Happ", url=route_link)]] if route_link and len(route_link) <= 4096 else []

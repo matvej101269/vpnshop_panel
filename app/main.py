@@ -333,6 +333,23 @@ async def health():
     return {"status": "ok"}
 
 
+def _normalize_routing_profile(rules: str) -> str:
+    """Accept JSON or a Happ routing deep link and return compact JSON."""
+    for prefix in ("happ://routing/add/", "happ://routing/onadd/"):
+        if rules.startswith(prefix):
+            encoded = unquote(rules[len(prefix):]).strip()
+            decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+            rules = decoded.decode("utf-8")
+            break
+    profile = json.loads(rules)
+    if not isinstance(profile, dict):
+        raise ValueError("Routing profile must be a JSON object")
+    compact = json.dumps(profile, ensure_ascii=False, separators=(",", ":"))
+    if len(compact.encode("utf-8")) > 8000:
+        raise ValueError("Routing profile is too large")
+    return compact
+
+
 @app.get("/happ/open/{token}", response_class=HTMLResponse)
 async def happ_open_bridge(token: str):
     """HTTPS handoff page that immediately tries the Happ app link, with a manual fallback."""
@@ -347,6 +364,26 @@ async def happ_open_bridge(token: str):
             target = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
         except (ValueError, UnicodeDecodeError, binascii.Error):
             raise HTTPException(status_code=400, detail="Некорректная ссылка Happ") from exc
+    try:
+        handoff_payload = json.loads(target)
+    except (TypeError, json.JSONDecodeError):
+        handoff_payload = None
+    if isinstance(handoff_payload, dict) and handoff_payload.get("action") == "apply_routing":
+        try:
+            sub_id = str(handoff_payload["sub_id"])
+            routing_rules = _normalize_routing_profile(str(handoff_payload["rules"]))
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError, binascii.Error) as exc:
+            raise HTTPException(status_code=400, detail="Некорректный профиль маршрутизации") from exc
+        with SessionLocal() as db:
+            sub = db.scalar(select(Subscription).where(Subscription.sub_id == sub_id))
+            if not sub or not sub.enabled or as_utc(sub.expires_at) <= datetime.now(timezone.utc):
+                raise HTTPException(status_code=400, detail="Нет активной подписки для применения правил")
+            expires = int((datetime.now(timezone.utc) + timedelta(minutes=2)).timestamp())
+            # This temporary marker is consumed by the next successful Happ
+            # subscription fetch, then the usual stable URL becomes route-free.
+            sub.routing_rules = f"pending:{expires}\n{routing_rules}"
+            db.commit()
+        target = f"happ://add/{happ_link(sub_id)}"
     if target.startswith("happ://routing/add/"):
         target = target.replace("happ://routing/add/", "happ://routing/onadd/", 1)
     valid = False
@@ -381,20 +418,27 @@ window.setTimeout(()=>{{document.getElementById('status').textContent='Если 
 
 @app.get("/happ/sub/{sub_id}")
 async def happ_subscription_proxy(sub_id: str, request: Request):
-    """Proxy a 3x-ui subscription; attach routing only to an explicitly routed URL."""
+    """Proxy a subscription; attach a staged routing profile once after user request."""
+    routing_rules = ""
+    pending_routing = ""
     with SessionLocal() as db:
         sub = db.scalar(select(Subscription).where(Subscription.sub_id == sub_id))
         if not sub:
             raise HTTPException(status_code=404, detail="Подписка не найдена")
-    routing_rules = ""
-    routing_token = request.query_params.get("routing", "")
-    if routing_token:
-        try:
-            routing_rules = decrypt_handoff(routing_token)
-            # Validate the signed payload before forwarding any value as a header.
-            json.loads(routing_rules)
-        except (ValueError, json.JSONDecodeError):
-            raise HTTPException(status_code=400, detail="Некорректный профиль маршрутизации")
+        stored_rules = sub.routing_rules or ""
+        marker, separator, staged_rules = stored_rules.partition("\n")
+        if separator and marker.startswith("pending:"):
+            try:
+                if int(marker.removeprefix("pending:")) >= int(datetime.now(timezone.utc).timestamp()):
+                    routing_rules = _normalize_routing_profile(staged_rules)
+                    pending_routing = stored_rules
+                else:
+                    sub.routing_rules = ""
+                    db.commit()
+            except (ValueError, TypeError, UnicodeDecodeError, binascii.Error) as exc:
+                sub.routing_rules = ""
+                db.commit()
+                raise HTTPException(status_code=400, detail="Некорректный профиль маршрутизации") from exc
     upstream_url = upstream_happ_link(sub_id)
     upstream = urlsplit(upstream_url)
     if upstream.scheme != "https" or not upstream.netloc:
@@ -422,6 +466,12 @@ async def happ_subscription_proxy(sub_id: str, request: Request):
         forwarded["X-Vpnshop-Routing-Attached"] = "0"
     logger.info("Happ subscription response served; status=%s routing_profile=%s",
                 upstream_response.status_code, "attached" if forwarded["X-Vpnshop-Routing-Attached"] == "1" else "none")
+    if pending_routing and upstream_response.is_success:
+        with SessionLocal() as db:
+            sub = db.scalar(select(Subscription).where(Subscription.sub_id == sub_id))
+            if sub and sub.routing_rules == pending_routing:
+                sub.routing_rules = ""
+                db.commit()
     return Response(content=upstream_response.content, status_code=upstream_response.status_code,
                     headers=forwarded)
 
