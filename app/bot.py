@@ -81,6 +81,15 @@ def routing_deep_link(rules: str) -> str:
     return prefix + quote(encoded, safe="")
 
 
+def happ_bridge_url(deep_link: str) -> str:
+    """Wrap a Happ custom-scheme link in an HTTPS URL accepted by Telegram."""
+    base = get_config("public_base_url").rstrip("/")
+    if urlsplit(base).scheme != "https" or not is_public_http_url(base):
+        return ""
+    token = base64.urlsafe_b64encode(deep_link.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{base}/happ/open/{token}"
+
+
 def menu_keyboard(db, parent_id: int | None, include_back: bool = True, telegram_id: int | None = None):
     nodes = db.scalars(select(BotMenuNode).where(
         BotMenuNode.parent_id == parent_id, BotMenuNode.enabled.is_(True)
@@ -90,7 +99,7 @@ def menu_keyboard(db, parent_id: int | None, include_back: bool = True, telegram
         if node.action == "url":
             rows.append([InlineKeyboardButton(text=node.label, url=node.url)])
         elif node.action == "routing" and node.routing_rules:
-            link = routing_deep_link(node.routing_rules)
+            link = happ_bridge_url(routing_deep_link(node.routing_rules))
             if len(link) <= 4096:
                 rows.append([InlineKeyboardButton(text=node.label, url=link)])
             else:
@@ -99,7 +108,7 @@ def menu_keyboard(db, parent_id: int | None, include_back: bool = True, telegram
             sub = db.get(Subscription, telegram_id)
             expiry = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
             link = happ_link(sub.sub_id) if sub and sub.enabled and expiry and expiry > datetime.now(timezone.utc) else ""
-            deep_link = f"happ://add/{link}" if link.startswith(("http://", "https://")) else ""
+            deep_link = happ_bridge_url(f"happ://add/{link}") if link.startswith(("http://", "https://")) else ""
             if deep_link and len(deep_link) <= 4096:
                 rows.append([InlineKeyboardButton(text=node.label, url=deep_link)])
             else:
@@ -174,19 +183,19 @@ async def show_menu(target, parent_id: int | None):
                 expires = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
                 link = happ_link(sub.sub_id) if sub and sub.enabled and expires and expires > datetime.now(timezone.utc) else ""
                 if link.startswith(("http://", "https://")):
-                    deep_link = f"happ://add/{link}"
-                    rows = [[InlineKeyboardButton(text="Открыть подписку в Happ", url=deep_link)]] if len(deep_link) <= 4096 else []
+                    deep_link = happ_bridge_url(f"happ://add/{link}")
+                    rows = [[InlineKeyboardButton(text="Открыть подписку в Happ", url=deep_link)]] if deep_link and len(deep_link) <= 4096 else []
                     back_keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
                     rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
                     keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
                     text = node.text or ("Нажмите кнопку, чтобы открыть Happ и добавить подписку." if rows else
-                                         "Ссылка подписки слишком длинная для кнопки Happ.")
+                                         "Для открытия Happ настройте публичный HTTPS-адрес панели.")
                 else:
                     text = node.text or "Активная подписка не найдена или не настроен URL подписки Happ."
                     keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
             elif node.action == "routing":
                 back_keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
-                route_link = routing_deep_link(node.routing_rules) if node.routing_rules else ""
+                route_link = happ_bridge_url(routing_deep_link(node.routing_rules)) if node.routing_rules else ""
                 rows = [[InlineKeyboardButton(text="Добавить правила в Happ", url=route_link)]] if route_link and len(route_link) <= 4096 else []
                 rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
                 keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None

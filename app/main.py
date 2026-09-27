@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import json
+import html
 import re
 import secrets
 import uuid
@@ -13,7 +14,7 @@ from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, func
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings as env_settings
 from app.db import (init_db, SessionLocal, Plan, AddonPackage, BotMenuNode, PendingPayment, Subscription,
@@ -175,6 +176,42 @@ async def logout(request: Request, _: None = Depends(admin)):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/happ/open/{token}", response_class=HTMLResponse)
+async def happ_open_bridge(token: str):
+    """HTTPS landing page for Happ links; Telegram rejects custom schemes in button URLs."""
+    if len(token) > 12000 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+        raise HTTPException(status_code=400, detail="Некорректная ссылка Happ")
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        target = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail="Некорректная ссылка Happ") from exc
+    valid = False
+    if target.startswith("happ://add/"):
+        subscription_url = target.removeprefix("happ://add/")
+        parsed_subscription = urlsplit(subscription_url)
+        valid = parsed_subscription.scheme == "https" and bool(parsed_subscription.netloc)
+    elif target.startswith("happ://routing/add/"):
+        route_data = target.removeprefix("happ://routing/add/")
+        try:
+            decoded = base64.b64decode(route_data, validate=True)
+            json.loads(decoded)
+            valid = bool(decoded) and len(decoded) <= 8000
+        except (ValueError, json.JSONDecodeError, binascii.Error):
+            valid = False
+    if not valid:
+        raise HTTPException(status_code=400, detail="Неподдерживаемая ссылка Happ")
+    escaped_target = html.escape(target, quote=True)
+    js_target = json.dumps(target, ensure_ascii=True).replace("<", "\\u003c")
+    page = f"""<!doctype html><html lang="ru"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Открыть Happ</title>
+<body style="font:16px system-ui;max-width:520px;margin:15vh auto;padding:24px;text-align:center;background:#10151d;color:#eef2f7">
+<h2>Открываем Happ</h2><p>Если приложение не открылось автоматически, нажмите кнопку.</p>
+<p><a style="display:inline-block;padding:14px 22px;border-radius:10px;background:#19a974;color:white;text-decoration:none" href="{escaped_target}">Открыть в Happ</a></p>
+<script>setTimeout(()=>{{window.location.href={js_target}}},150);</script></body></html>"""
+    return HTMLResponse(page, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
 @app.get("/offer", response_class=HTMLResponse)
@@ -645,6 +682,7 @@ async def update_settings(request: Request, _: None = Depends(admin)):
     origin_port = "" if (scheme, panel_port) in {("http", 80), ("https", 443)} else f":{panel_port}"
     values.update(panel_scheme=scheme, panel_domain=domain, panel_port=str(panel_port), panel_uri_path=uri_path,
                   public_base_url=f"{scheme}://{domain}{origin_port}")
+    old_global_inbounds = XUIClient._inbound_ids(get_config_map())
     inbound_ids = sorted({int(value) for value in str(form.get("xui_inbound_ids", "")).split(",")
                           if value.strip().isdigit() and int(value) > 0})
     if not inbound_ids:
@@ -657,6 +695,24 @@ async def update_settings(request: Request, _: None = Depends(admin)):
             values[key] = submitted
     labels = {key: str(form.get(field, "")).strip() for key, field in SECRET_LABELS.items()}
     save_config(values, labels)
+    if set(old_global_inbounds) != set(inbound_ids):
+        changed = 0
+        try:
+            with SessionLocal() as db:
+                subs = db.scalars(select(Subscription)).all()
+                for sub in subs:
+                    current_ids = [int(value) for value in sub.inbound_ids.split(",") if value.strip().isdigit()]
+                    if not current_ids:
+                        current_ids = old_global_inbounds
+                    await XUIClient().set_client_inbounds(sub.telegram_id, sub.sub_id, current_ids, inbound_ids)
+                    sub.inbound_ids = ",".join(str(value) for value in inbound_ids)
+                    db.commit()
+                    changed += 1
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=(
+                f"Настройки сохранены, но обновление inbound остановилось после {changed} клиентов. "
+                f"Исправьте подключение к 3x-ui и сохраните эти же inbound ещё раз. Ошибка: {exc}"
+            )) from exc
     new_username = str(form.get("admin_username", "")).strip()
     new_password = str(form.get("admin_password", ""))
     if new_username:

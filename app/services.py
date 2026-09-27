@@ -105,6 +105,42 @@ class XUIClient:
             if result.get("success") is False:
                 raise RuntimeError(f"3x-ui error: {result.get('msg', 'unknown error')}")
 
+    async def set_client_inbounds(self, telegram_id: int, sub_id: str, current_ids: list[int], target_ids: list[int]):
+        """Reconcile an existing client's inbound attachments in 3x-ui 3.8.5."""
+        cfg = get_config_map()
+        if not cfg["xui_base_url"] or (not cfg["xui_api_token"] and not all((cfg["xui_username"], cfg["xui_password"]))):
+            raise RuntimeError("Не настроено подключение к 3x-ui")
+        base = cfg["xui_base_url"].rstrip("/")
+        api = base + "/" + cfg["xui_api_base_path"].strip("/")
+        email = self._email(telegram_id)
+        previous = set(self._inbound_ids(cfg, current_ids))
+        target = set(self._inbound_ids(cfg, target_ids))
+        attach, detach = sorted(target - previous), sorted(previous - target)
+        if not attach and not detach:
+            return
+        headers = {"Authorization": f"Bearer {cfg['xui_api_token']}"} if cfg["xui_api_token"] else {}
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            if not cfg["xui_api_token"]:
+                login = await client.post(f"{base}/{cfg['xui_login_path'].lstrip('/')}",
+                                          data={"username": cfg["xui_username"], "password": cfg["xui_password"]})
+                login.raise_for_status()
+            for action, ids in (("attach", attach), ("detach", detach)):
+                if not ids:
+                    continue
+                response = await client.post(f"{api}/clients/{quote(email)}/{action}",
+                                             json={"inboundIds": ids}, headers=headers)
+                if response.status_code == 404:
+                    legacy = f"sub-{sub_id}@vpn.invalid"
+                    response = await client.post(f"{api}/clients/{quote(legacy)}/{action}",
+                                                 json={"inboundIds": ids}, headers=headers)
+                response.raise_for_status()
+                try:
+                    result = response.json()
+                except ValueError:
+                    result = {}
+                if result.get("success") is False:
+                    raise RuntimeError(f"3x-ui {action} error: {result.get('msg') or 'unknown error'}")
+
     @staticmethod
     async def ensure_group(client: httpx.AsyncClient, api: str, group_name: str, headers: dict):
         response = await client.get(f"{api}/clients/groups", headers=headers)

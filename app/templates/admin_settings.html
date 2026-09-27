@@ -6,7 +6,7 @@
 {% for key,title in [('lava_offer_id','Offer ID'),('lava_api_key','API key Lava.top'),('lava_webhook_key','Webhook key')] %}<div class="form-row"><label>{{title}}</label><div class="secret-field"><input type="password" name="{{key}}" data-secret-key="{{key}}" autocomplete="new-password" placeholder="{{'Сохранён — нажмите глаз' if secret_status[key].configured else 'Не задан'}}"><button type="button" class="btn-quiet reveal-secret" aria-label="Показать секрет">◉</button><span class="secret-status">{{'Сохранён' if secret_status[key].configured else 'Не задан'}}</span></div></div>{% endfor %}
 <div class="form-row"><label>Провайдер оплаты</label><input name="lava_payment_provider" value="{{config.lava_payment_provider}}" placeholder="Пусто — выбор Lava.top"></div>
 </div></section>
-<section class="section"><div class="section-head"><div><h2>3x-ui</h2><p>Email клиента в 3x-ui будет равен Telegram ID. Новые клиенты добавляются на все выбранные inbound.</p></div></div><div class="form-panel">
+<section class="section"><div class="section-head"><div><h2>3x-ui</h2><p>Email клиента в 3x-ui будет равен Telegram ID. При изменении выбранных inbound существующие клиенты синхронизируются с новым списком.</p></div></div><div class="form-panel">
 <div class="form-row"><label>Адрес панели</label><input name="xui_base_url" value="{{config.xui_base_url}}" placeholder="https://panel.example.com:2053"></div>
 <div class="form-row"><label>Путь API</label><input name="xui_api_base_path" value="{{config.xui_api_base_path}}" placeholder="/panel/api"></div>
 <div class="form-row"><label>Путь входа</label><input name="xui_login_path" value="{{config.xui_login_path}}" placeholder="/login"></div>
