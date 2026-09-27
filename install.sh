@@ -72,12 +72,14 @@ certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
 git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
 ADMIN_USER="admin_$(openssl rand -hex 3)"
 ADMIN_PASSWORD="$(openssl rand -hex 24)"
+CONTROL_TOKEN="$(openssl rand -hex 32)"
 PUBLIC_URL="https://$DOMAIN"
 if [[ "$PANEL_PORT" != 443 ]]; then PUBLIC_URL="$PUBLIC_URL:$PANEL_PORT"; fi
 cat >"$INSTALL_DIR/.env" <<EOF
 DATABASE_URL=sqlite:///./data/vpnshop.db
 ADMIN_USER=$ADMIN_USER
 ADMIN_PASSWORD=$ADMIN_PASSWORD
+CONTROL_TOKEN=$CONTROL_TOKEN
 PUBLIC_BASE_URL=$PUBLIC_URL
 EOF
 chmod 600 "$INSTALL_DIR/.env"

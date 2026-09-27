@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     admin_user: str = "admin"
     admin_password: str = "change-me"
     admin_session_secret: str = "change-me"
+    control_api_url: str = "http://vpnshop-control:8765"
+    control_api_token: str = ""
     lava_api_key: str = ""
     lava_offer_id: str = ""
     lava_webhook_key: str = ""

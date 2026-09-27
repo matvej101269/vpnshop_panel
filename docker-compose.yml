@@ -2,10 +2,22 @@ services:
   vpnshop:
     build: .
     env_file: .env
+    environment:
+      CONTROL_API_URL: http://vpnshop-control:8765
+      CONTROL_API_TOKEN: ${CONTROL_TOKEN:-}
     restart: unless-stopped
     volumes:
       - vpnshop-data:/app/data
     ports:
       - "127.0.0.1:8000:8000"
+  vpnshop-control:
+    build: ./ops-control
+    environment:
+      CONTROL_TOKEN: ${CONTROL_TOKEN:-}
+      PROJECT_DIR: /opt/vpnshop
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/opt/vpnshop
+    restart: unless-stopped
 volumes:
   vpnshop-data:

@@ -13,6 +13,7 @@ from collections import Counter
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+import httpx
 from sqlalchemy import select, func
 from urllib.parse import unquote, urlsplit
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -29,7 +30,7 @@ from app.runtime_config import (init_runtime_config, get_config, save_config, co
 templates = Jinja2Templates(directory="app/templates")
 scheduler = AsyncIOScheduler(timezone=env_settings.timezone)
 bot_task: asyncio.Task | None = None
-SECTIONS = {"overview", "users", "subscriptions", "addons", "history", "settings", "botmenu"}
+SECTIONS = {"overview", "users", "subscriptions", "addons", "history", "settings", "botmenu", "system"}
 SECRET_LABELS = {
     "bot_token": "name_bot_token", "lava_api_key": "name_lava_api_key", "lava_offer_id": "name_lava_offer_id",
     "lava_webhook_key": "name_lava_webhook_key", "xui_password": "name_xui_password",
@@ -98,6 +99,21 @@ async def restart_bot_runtime():
         await asyncio.gather(bot_task, return_exceptions=True)
     token = get_config("bot_token")
     bot_task = asyncio.create_task(start_bot(token)) if token else None
+
+
+async def call_control_api(method: str, path: str, timeout: float = 30):
+    if not env_settings.control_api_token:
+        raise HTTPException(status_code=503, detail="Системное управление не настроено. Обновите .env на VPS и перезапустите Compose.")
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.request(method, env_settings.control_api_url.rstrip("/") + path,
+                                            headers={"Authorization": f"Bearer {env_settings.control_api_token}"})
+        if response.status_code >= 400:
+            detail = response.text[:1000]
+            raise HTTPException(status_code=502, detail=f"Сервис управления вернул ошибку: {detail}")
+        return response
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="Сервис управления недоступен. Проверьте Docker Compose.") from exc
 
 
 @asynccontextmanager
@@ -180,7 +196,7 @@ async def health():
 
 @app.get("/happ/open/{token}", response_class=HTMLResponse)
 async def happ_open_bridge(token: str):
-    """HTTPS landing page for Happ links; Telegram rejects custom schemes in button URLs."""
+    """HTTPS handoff page: copy import data, then launch Happ from a user gesture."""
     if len(token) > 12000 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
         raise HTTPException(status_code=400, detail="Некорректная ссылка Happ")
     try:
@@ -189,28 +205,45 @@ async def happ_open_bridge(token: str):
     except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
         raise HTTPException(status_code=400, detail="Некорректная ссылка Happ") from exc
     valid = False
+    clipboard_value = ""
     if target.startswith("happ://add/"):
         subscription_url = target.removeprefix("happ://add/")
         parsed_subscription = urlsplit(subscription_url)
         valid = parsed_subscription.scheme == "https" and bool(parsed_subscription.netloc)
+        clipboard_value = subscription_url
     elif target.startswith("happ://routing/add/"):
         route_data = target.removeprefix("happ://routing/add/")
         try:
             decoded = base64.b64decode(route_data, validate=True)
             json.loads(decoded)
             valid = bool(decoded) and len(decoded) <= 8000
+            clipboard_value = target
         except (ValueError, json.JSONDecodeError, binascii.Error):
             valid = False
     if not valid:
         raise HTTPException(status_code=400, detail="Неподдерживаемая ссылка Happ")
     escaped_target = html.escape(target, quote=True)
+    escaped_clipboard = html.escape(clipboard_value, quote=True)
     js_target = json.dumps(target, ensure_ascii=True).replace("<", "\\u003c")
     page = f"""<!doctype html><html lang="ru"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Открыть Happ</title>
-<body style="font:16px system-ui;max-width:520px;margin:15vh auto;padding:24px;text-align:center;background:#10151d;color:#eef2f7">
-<h2>Открываем Happ</h2><p>Если приложение не открылось автоматически, нажмите кнопку.</p>
-<p><a style="display:inline-block;padding:14px 22px;border-radius:10px;background:#19a974;color:white;text-decoration:none" href="{escaped_target}">Открыть в Happ</a></p>
-<script>setTimeout(()=>{{window.location.href={js_target}}},150);</script></body></html>"""
+<body style="font:16px system-ui;max-width:520px;margin:12vh auto;padding:24px;text-align:center;background:#10151d;color:#eef2f7">
+<h2>Импорт в Happ</h2><p>Скопируем данные в буфер и попробуем открыть приложение.</p>
+<button id="handoff" style="border:0;padding:14px 22px;border-radius:10px;background:#19a974;color:white;font-size:16px">Скопировать и открыть Happ</button>
+<p id="status" aria-live="polite" style="color:#aab5c3"></p>
+<p><a style="color:#8ab4ff" href="{escaped_target}">Открыть Happ без копирования</a></p>
+<textarea id="copy-value" readonly style="position:fixed;left:-10000px;top:0">{escaped_clipboard}</textarea>
+<script>
+const target={js_target};
+const status=document.getElementById('status');
+document.getElementById('handoff').addEventListener('click',async()=>{{
+  const field=document.getElementById('copy-value');field.focus();field.select();
+  let copied=false;try{{copied=document.execCommand('copy')}}catch{{}}
+  if(!copied&&navigator.clipboard){{try{{await navigator.clipboard.writeText(field.value);copied=true}}catch{{}}}}
+  status.textContent=copied?'Ссылка скопирована. Открываем Happ…':'Не удалось скопировать автоматически. Открываем Happ; если нужно, скопируйте ссылку вручную.';
+  window.location.href=target;
+}});
+</script></body></html>"""
     return HTMLResponse(page, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
@@ -337,6 +370,8 @@ async def admin_page(section: str, request: Request, _: None = Depends(admin)):
             walk(None)
             ctx.update(menu_rows=menu_rows, menu_labels=menu_labels, bot_welcome_text=get_config("bot_welcome_text"),
                        offer_text=get_config("offer_text"), public_base_url=get_config("public_base_url"))
+        elif section == "system":
+            ctx.update(control_enabled=bool(env_settings.control_api_token), operation=request.query_params.get("operation", ""))
         return templates.TemplateResponse(request, "admin_base.html", ctx | {"section_body": f"admin_{section}.html"})
 
 
@@ -520,6 +555,32 @@ async def reveal_secret(key: str, _: None = Depends(admin)):
     if key not in SECRET_KEYS:
         raise HTTPException(status_code=404)
     return {"value": get_config(key)}
+
+
+@app.get("/admin/api/system/logs")
+async def system_logs(_: None = Depends(admin)):
+    response = await call_control_api("GET", "/logs?lines=500")
+    return {"logs": response.text}
+
+
+@app.get("/admin/api/system/status")
+async def system_status(_: None = Depends(admin)):
+    response = await call_control_api("GET", "/status")
+    return response.json()
+
+
+@app.post("/admin/system/restart")
+async def system_restart(request: Request, _: None = Depends(admin)):
+    await checked_form(request)
+    await call_control_api("POST", "/restart", timeout=90)
+    return RedirectResponse("/admin/system?operation=restarting", status_code=303)
+
+
+@app.post("/admin/system/update")
+async def system_update(request: Request, _: None = Depends(admin)):
+    await checked_form(request)
+    await call_control_api("POST", "/update", timeout=900)
+    return RedirectResponse("/admin/system?operation=updating", status_code=303)
 
 
 @app.post("/admin/botmenu/content")

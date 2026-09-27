@@ -37,14 +37,19 @@ class SinglePollDispatcher(Dispatcher):
             try:
                 updates = await bot(get_updates, **kwargs)
             except TelegramConflictError:
-                logger.error("Telegram polling conflict: stop this instance; another process is polling the same bot token")
-                raise
+                logger.error("Telegram polling stopped: another process is already using this bot token")
+                return
             except TelegramUnauthorizedError:
                 logger.error("Telegram rejected the bot token; update it in admin settings")
-                raise
+                return
+            except (TelegramNetworkError, TelegramServerError) as exc:
+                failed = True
+                logger.warning("Telegram connection interrupted; retrying with backoff: %s: %s", type(exc).__name__, exc)
+                await backoff.asleep()
+                continue
             except Exception as exc:
                 failed = True
-                logger.error("Telegram update polling failed: %s: %s", type(exc).__name__, exc)
+                logger.exception("Unexpected Telegram polling error; retrying with backoff: %s", type(exc).__name__)
                 await backoff.asleep()
                 continue
             if failed:
@@ -285,6 +290,7 @@ async def start_bot(token: str):
         try:
             logger.info("Connecting Telegram bot via long polling")
             await dp.start_polling(bot)
+            logger.info("Telegram polling stopped")
             return
         except (TelegramNetworkError, TelegramServerError) as exc:
             logger.warning("Telegram connection failed; retrying in %s seconds: %s", delay, exc)

@@ -15,6 +15,7 @@
 <a class="{{ 'active' if section=='history' else '' }}" href="/admin/history"><span class="ico">◷</span><span>История подписок</span></a>
 <a class="{{ 'active' if section=='botmenu' else '' }}" href="/admin/botmenu"><span class="ico">☷</span><span>Конструктор бота</span></a>
 <a class="{{ 'active' if section=='settings' else '' }}" href="/admin/settings"><span class="ico">⚙</span><span>Настройки</span></a>
+<a class="{{ 'active' if section=='system' else '' }}" href="/admin/system"><span class="ico">⌁</span><span>Система и логи</span></a>
 </nav><div class="side-foot">VPN service · Admin</div></aside>
 <main class="main"><header class="top"><div class="crumb">VPN Panel <span class="muted">/ {{ section }}</span></div><form method="post" action="/logout" style="display:flex;align-items:center;gap:8px;margin:0"><div class="admin-chip">● &nbsp;Администратор</div><button type="submit" class="btn-quiet">Выйти</button></form></header>
 <div class="content">{% include section_body %}<footer>VPN service · панель управления</footer></div></main></div>
