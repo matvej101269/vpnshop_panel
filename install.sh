@@ -122,6 +122,7 @@ server {
 }
 NGINX_TLS
 nginx -t
+systemctl reload nginx || systemctl start nginx
 
 cat >/etc/letsencrypt/renewal-hooks/deploy/reload-vpnshop-nginx <<'HOOK'
 #!/usr/bin/env sh
