@@ -58,6 +58,13 @@ class AddonBalance(Base):
     reset_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
+class TrialClaim(Base):
+    """Permanent trial-block marker; stores only the Telegram ID and claim time."""
+    __tablename__ = "trial_claims"
+    telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    claimed_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class PendingPayment(Base):
     """Temporary mapping needed to connect a payment webhook to a Telegram account."""
     __tablename__ = "pending_payments"

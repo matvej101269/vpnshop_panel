@@ -4,7 +4,7 @@ import ipaddress
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Optional
 from aiogram import Bot, Dispatcher, F
 from aiogram.dispatcher.dispatcher import DEFAULT_BACKOFF_CONFIG
@@ -16,11 +16,21 @@ from aiogram.exceptions import (TelegramNetworkError, TelegramServerError, Teleg
 from aiogram.utils.backoff import Backoff, BackoffConfig
 from urllib.parse import quote, urlsplit
 from sqlalchemy import select
-from app.db import SessionLocal, Plan, AddonPackage, PendingPayment, BotMenuNode, Subscription
+from sqlalchemy.exc import IntegrityError
+from app.db import (SessionLocal, Plan, AddonPackage, PendingPayment, BotMenuNode,
+                    Subscription, SubscriptionHistory, TrialClaim)
 from app.services import LavaClient, XUIClient, happ_link, quote_immediate_switch, provision_paid_invoice
-from app.runtime_config import get_config, encrypt_handoff
+from app.runtime_config import get_config, get_config_map, encrypt_handoff
 
 logger = logging.getLogger(__name__)
+
+
+def _trial_already_used(db, telegram_id: int) -> bool:
+    return bool(db.get(Subscription, telegram_id) or db.get(TrialClaim, telegram_id) or
+                db.scalar(select(SubscriptionHistory.id).where(
+                    SubscriptionHistory.telegram_id == telegram_id).limit(1)) or
+                db.scalar(select(PendingPayment.invoice_id).where(
+                    PendingPayment.telegram_id == telegram_id).limit(1)))
 
 
 class SinglePollDispatcher(Dispatcher):
@@ -106,6 +116,9 @@ def menu_keyboard(db, parent_id: int | None, include_back: bool = True, telegram
     for node in nodes:
         if node.action == "url":
             rows.append([InlineKeyboardButton(text=node.label, url=node.url)])
+        elif node.action == "trial":
+            if telegram_id is not None and not _trial_already_used(db, telegram_id):
+                rows.append([InlineKeyboardButton(text=node.label, callback_data=f"trial:{node.id}")])
         elif node.action == "routing" and node.routing_rules:
             # Route actions need a callback first: it associates the profile with
             # the user's active subscription before generating its Happ URL.
@@ -121,6 +134,11 @@ def menu_keyboard(db, parent_id: int | None, include_back: bool = True, telegram
                 rows.append([InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}")])
         else:
             rows.append([InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}")])
+    if parent_id is None and telegram_id is not None:
+        configured_trial = db.scalar(select(BotMenuNode.id).where(
+            BotMenuNode.action == "trial", BotMenuNode.enabled.is_(True)).limit(1))
+        if not configured_trial and not _trial_already_used(db, telegram_id):
+            rows.append([InlineKeyboardButton(text="Пробный период · 3 дня", callback_data="trial:0")])
     if include_back and parent_id is not None:
         parent = db.get(BotMenuNode, parent_id)
         back_parent = parent.parent_id if parent else None
@@ -249,6 +267,89 @@ async def open_menu(callback: CallbackQuery):
     parent_id = int(raw_id) if raw_id.isdigit() and int(raw_id) else None
     await show_menu(callback, parent_id)
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("trial:"))
+async def start_trial(callback: CallbackQuery):
+    raw_id = callback.data.split(":", 1)[1]
+    if not raw_id.isdigit():
+        await callback.answer("Пробный период недоступен.", show_alert=True)
+        return
+    telegram_id = callback.from_user.id
+    menu_parent_id = None
+    with SessionLocal() as db:
+        node_id = int(raw_id)
+        if node_id:
+            node = db.get(BotMenuNode, node_id)
+            if not node or not node.enabled or node.action != "trial":
+                await callback.answer("Пробный период недоступен.", show_alert=True)
+                return
+            menu_parent_id = node.parent_id
+        if _trial_already_used(db, telegram_id):
+            await callback.answer("Пробный период доступен только новым пользователям.", show_alert=True)
+            return
+        db.add(TrialClaim(telegram_id=telegram_id))
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            await callback.answer("Пробный период уже был использован.", show_alert=True)
+            return
+
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=3)
+    sub_id = uuid.uuid4().hex[:20]
+    xui_created = False
+    try:
+        inbounds = XUIClient._inbound_ids(get_config_map())
+        await XUIClient().add_or_update_client(
+            telegram_id, sub_id, int(expires.timestamp() * 1000), 0, exists=False,
+            limit_hwid=0, traffic_reset="never", inbound_ids=inbounds,
+            group_name="Пробный период")
+        xui_created = True
+        with SessionLocal() as db:
+            if db.get(Subscription, telegram_id):
+                raise RuntimeError("Пользователь уже получил подписку")
+            db.add(Subscription(telegram_id=telegram_id, sub_id=sub_id, expires_at=expires,
+                                plan_id=None, plan_name="Пробный период", current_price=0,
+                                currency="RUB", traffic_limit_bytes=0, limit_hwid=0,
+                                traffic_reset="never", inbound_ids=",".join(map(str, inbounds)),
+                                enabled=True))
+            db.add(SubscriptionHistory(telegram_id=telegram_id, plan_name="Пробный период",
+                                       plan_days=3, price=0, currency="RUB", traffic_limit_bytes=0,
+                                       starts_at=now.replace(tzinfo=None), expires_at=expires.replace(tzinfo=None)))
+            db.commit()
+    except Exception:
+        logger.exception("Could not provision a trial subscription for Telegram ID %s", telegram_id)
+        rollback_ok = True
+        if xui_created:
+            try:
+                await XUIClient().delete_client(sub_id, telegram_id)
+            except Exception:
+                rollback_ok = False
+                logger.exception("Could not roll back the 3x-ui trial client for Telegram ID %s", telegram_id)
+        if rollback_ok:
+            with SessionLocal() as db:
+                claim = db.get(TrialClaim, telegram_id)
+                if claim:
+                    db.delete(claim)
+                    db.commit()
+        await callback.answer("Не удалось выдать пробный период. Попробуйте позже.", show_alert=True)
+        return
+
+    link = happ_link(sub_id)
+    bridge = happ_bridge_url(f"happ://add/{link}") if link else ""
+    text = f"Пробный период на 3 дня активирован. Действует до {expires:%d.%m.%Y %H:%M UTC}."
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="Открыть подписку в Happ", url=bridge)]]) if bridge else None
+    try:
+        with SessionLocal() as db:
+            menu_markup = menu_keyboard(db, menu_parent_id, telegram_id=telegram_id)
+        await callback.message.edit_reply_markup(reply_markup=menu_markup)
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer(text, reply_markup=keyboard)
+    await callback.answer("Пробный период активирован")
 
 
 @dp.callback_query(F.data.startswith("buy:"))

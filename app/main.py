@@ -21,7 +21,7 @@ from sqlalchemy import select, func
 from urllib.parse import unquote, urlsplit
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings as env_settings
-from app.db import (init_db, SessionLocal, Plan, AddonPackage, AddonBalance, BotMenuNode, PendingPayment, FulfillmentJob, ProcessedPayment, Subscription,
+from app.db import (init_db, SessionLocal, Plan, AddonPackage, AddonBalance, TrialClaim, BotMenuNode, PendingPayment, FulfillmentJob, ProcessedPayment, Subscription,
                     SubscriptionHistory, AdminAccount)
 from app.services import (provision_paid_invoice, reconcile_addon_balances, XUIClient,
                           happ_link, upstream_happ_link)
@@ -629,7 +629,7 @@ def validate_menu_values(form, db, current_id: int | None = None):
     parent_raw = str(form.get("parent_id", "")).strip()
     if not label or len(label) > 64:
         raise HTTPException(status_code=400, detail="Название кнопки должно быть от 1 до 64 символов")
-    if action not in {"menu", "plans", "change_plan", "subscription_info", "addons", "offer", "url", "open_happ", "routing"}:
+    if action not in {"menu", "plans", "change_plan", "subscription_info", "addons", "offer", "url", "open_happ", "routing", "trial"}:
         raise HTTPException(status_code=400, detail="Неизвестное действие кнопки")
     parent_id = int(parent_raw) if parent_raw.isdigit() and int(parent_raw) > 0 else None
     if parent_id is not None:
@@ -842,6 +842,22 @@ async def system_backup(request: Request, _: None = Depends(admin)):
     return RedirectResponse("/admin/system?backup=created", status_code=303)
 
 
+@app.post("/admin/system/backup/{filename}/delete")
+async def delete_backup(filename: str, request: Request, _: None = Depends(admin)):
+    await checked_form(request)
+    if not re.fullmatch(r"vpnshop-[0-9]{8}-[0-9]{6}(?:-[0-9]{6})?\.vpbak", filename):
+        raise HTTPException(status_code=404)
+    root = backup_directory().resolve()
+    path = (root / filename).resolve()
+    if path.parent != root or not path.is_file():
+        raise HTTPException(status_code=404)
+    try:
+        await asyncio.to_thread(path.unlink)
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="Не удалось удалить резервную копию") from exc
+    return RedirectResponse("/admin/system?backup=deleted", status_code=303)
+
+
 @app.post("/admin/system/reconcile")
 async def system_reconcile(request: Request, _: None = Depends(admin)):
     await checked_form(request)
@@ -888,11 +904,14 @@ async def edit_plan(plan_id: int, request: Request, _: None = Depends(admin)):
     traffic_reset = str(form.get("traffic_reset", "never"))
     if traffic_reset not in {"never", "hourly", "daily", "weekly", "monthly"}:
         raise HTTPException(status_code=400, detail="Некорректный период сброса трафика")
+    renamed_subscribers = []
     with SessionLocal() as db:
         plan = db.get(Plan, plan_id)
         if not plan:
             raise HTTPException(status_code=404)
-        plan.name = str(form["name"]).strip()
+        new_name = str(form["name"]).strip()
+        renamed = new_name != plan.name
+        plan.name = new_name
         plan.days = int(form["days"])
         plan.amount = int(form["amount"])
         plan.currency = str(form.get("currency", "RUB")).strip().upper()
@@ -901,7 +920,32 @@ async def edit_plan(plan_id: int, request: Request, _: None = Depends(admin)):
         plan.show_in_bot = form.get("show_in_bot") == "on"
         plan.limit_hwid = max(0, int(form.get("limit_hwid", 0)))
         plan.traffic_reset = traffic_reset
+        if renamed:
+            renamed_subscribers = db.scalars(select(Subscription).where(
+                Subscription.plan_id == plan_id)).all()
+            for sub in renamed_subscribers:
+                sub.plan_name = new_name
         db.commit()
+    sync_failed = []
+    for sub in renamed_subscribers:
+        try:
+            await XUIClient().add_or_update_client(
+                sub.telegram_id, sub.sub_id, int(as_utc(sub.expires_at).timestamp() * 1000),
+                sub.traffic_limit_bytes, exists=True, limit_hwid=sub.limit_hwid,
+                traffic_reset=sub.traffic_reset,
+                inbound_ids=[int(value) for value in sub.inbound_ids.split(",") if value.isdigit()] or None,
+                enabled=sub.enabled, group_name=new_name)
+        except Exception:
+            logger.exception("Could not update 3x-ui group for Telegram ID %s after renaming plan %s",
+                             sub.telegram_id, plan_id)
+            sync_failed.append(sub.telegram_id)
+    if sync_failed:
+        with SessionLocal() as db:
+            for telegram_id in sync_failed:
+                sub = db.get(Subscription, telegram_id)
+                if sub:
+                    sub.sync_status = "plan_name_sync_failed"
+            db.commit()
     return RedirectResponse("/admin/subscriptions", status_code=303)
 
 
@@ -986,7 +1030,10 @@ async def edit_user(telegram_id: int, request: Request, _: None = Depends(admin)
 
 async def remove_subscription(db, sub: Subscription):
     await XUIClient().delete_client(sub.sub_id, sub.telegram_id)
-    db.query(SubscriptionHistory).filter(SubscriptionHistory.telegram_id == sub.telegram_id).delete(synchronize_session=False)
+    if not db.get(TrialClaim, sub.telegram_id):
+        db.add(TrialClaim(telegram_id=sub.telegram_id))
+    db.query(SubscriptionHistory).filter(
+        SubscriptionHistory.telegram_id == sub.telegram_id).delete(synchronize_session=False)
     addon_balance = db.get(AddonBalance, sub.telegram_id)
     if addon_balance:
         db.delete(addon_balance)
