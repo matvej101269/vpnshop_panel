@@ -73,6 +73,7 @@ git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
 ADMIN_USER="admin_$(openssl rand -hex 3)"
 ADMIN_PASSWORD="$(openssl rand -hex 24)"
 CONTROL_TOKEN="$(openssl rand -hex 32)"
+BACKUP_ENCRYPTION_KEY="$(openssl rand -base64 32 | tr '+/' '-_')"
 PUBLIC_URL="https://$DOMAIN"
 if [[ "$PANEL_PORT" != 443 ]]; then PUBLIC_URL="$PUBLIC_URL:$PANEL_PORT"; fi
 cat >"$INSTALL_DIR/.env" <<EOF
@@ -80,6 +81,7 @@ DATABASE_URL=sqlite:///./data/vpnshop.db
 ADMIN_USER=$ADMIN_USER
 ADMIN_PASSWORD=$ADMIN_PASSWORD
 CONTROL_TOKEN=$CONTROL_TOKEN
+BACKUP_ENCRYPTION_KEY=$BACKUP_ENCRYPTION_KEY
 PUBLIC_BASE_URL=$PUBLIC_URL
 EOF
 chmod 600 "$INSTALL_DIR/.env"
@@ -94,6 +96,8 @@ server {
     listen 80;
     listen [::]:80;
     server_name $DOMAIN;
+    access_log off;
+    error_log /var/log/nginx/vpnshop-error.log warn;
     location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }
     location / { return 301 $REDIRECT_URL; }
 }
@@ -102,6 +106,8 @@ server {
     listen $PANEL_PORT ssl;
     listen [::]:$PANEL_PORT ssl;
     server_name $DOMAIN;
+    access_log off;
+    error_log /var/log/nginx/vpnshop-error.log warn;
     ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
     client_max_body_size 2m;

@@ -3,9 +3,12 @@ import base64
 import binascii
 import json
 import html
+import hashlib
+import logging
 import re
 import secrets
 import uuid
+from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -13,21 +16,25 @@ from collections import Counter
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import httpx
 from sqlalchemy import select, func
 from urllib.parse import unquote, urlsplit
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings as env_settings
-from app.db import (init_db, SessionLocal, Plan, AddonPackage, BotMenuNode, PendingPayment, Subscription,
+from app.db import (init_db, SessionLocal, Plan, AddonPackage, BotMenuNode, PendingPayment, FulfillmentJob, ProcessedPayment, Subscription,
                     SubscriptionHistory, AdminAccount)
 from app.services import provision_paid_invoice, XUIClient
-from app.bot import start_bot, notify_user
+from app.backups import create_backup, backup_directory
+from app.bot import start_bot, notify_user, happ_bridge_url
 from app.runtime_config import (init_runtime_config, get_config, save_config, config_status,
                                 verify_admin, save_admin_account, CONFIG_DEFAULTS, SECRET_KEYS,
                                 make_csrf_token, verify_csrf_token, get_config_map,
                                 create_admin_session, verify_admin_session)
+from app.runtime_config import decrypt_handoff
 
 templates = Jinja2Templates(directory="app/templates")
+logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler(timezone=env_settings.timezone)
 bot_task: asyncio.Task | None = None
 SECTIONS = {"overview", "users", "subscriptions", "addons", "history", "settings", "botmenu", "system"}
@@ -61,6 +68,13 @@ def remaining_days(expires: datetime) -> int:
     return max(0, (as_utc(expires).date() - datetime.now(timezone.utc).date()).days)
 
 
+def sanitized_error(exc: Exception) -> str:
+    detail = re.sub(r"https?://\S+", "[URL]", str(exc))
+    detail = re.sub(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[EMAIL]", detail, flags=re.I)
+    detail = re.sub(r"\b\d{6,20}\b", "[ID]", detail)
+    return f"{type(exc).__name__}: {detail[:300]}"
+
+
 async def send_reminders():
     offsets = {int(v.strip()) for v in get_config("reminder_days").split(",") if v.strip().isdigit()}
     now = datetime.now(timezone.utc)
@@ -75,21 +89,141 @@ async def send_reminders():
         for sub in subscriptions:
             left = (as_utc(sub.expires_at).astimezone(local_zone).date() - local_today).days
             if left in offsets and str(left) not in sub.reminded.split(","):
-                messages.append((sub.telegram_id, left))
-                sub.reminded = (sub.reminded + "," if sub.reminded else "") + str(left)
-        db.commit()
-    for tg_id, left in messages:
+                messages.append((sub.telegram_id, left, sub.expires_at))
+    for tg_id, left, expiry in messages:
         try:
             await notify_user(tg_id, f"Срок VPN-подписки заканчивается через {left} дн. Продлите её в боте командой /start.")
+            with SessionLocal() as db:
+                sub = db.get(Subscription, tg_id)
+                if sub and sub.expires_at == expiry:
+                    sent = set(filter(None, sub.reminded.split(",")))
+                    sent.add(str(left))
+                    sub.reminded = ",".join(sorted(sent))
+                    db.commit()
         except Exception:
-            continue
+            pass
 
 
 async def purge_old_pending_payments():
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=7)
     with SessionLocal() as db:
-        db.query(PendingPayment).filter(PendingPayment.created_at < cutoff).delete(synchronize_session=False)
+        active_ids = select(FulfillmentJob.invoice_id).where(FulfillmentJob.status != "done")
+        db.query(PendingPayment).filter(PendingPayment.created_at < cutoff, ~PendingPayment.invoice_id.in_(active_ids)).delete(synchronize_session=False)
+        db.query(FulfillmentJob).filter(FulfillmentJob.status == "done", FulfillmentJob.created_at < cutoff).delete(synchronize_session=False)
         db.commit()
+
+
+async def process_payment_jobs():
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with SessionLocal() as db:
+        stale_claim = now - timedelta(minutes=30)
+        db.query(FulfillmentJob).filter(FulfillmentJob.status == "processing",
+                                         (FulfillmentJob.claimed_at.is_(None) | (FulfillmentJob.claimed_at < stale_claim))).update(
+            {FulfillmentJob.status: "retry", FulfillmentJob.next_attempt_at: now}, synchronize_session=False)
+        jobs = db.scalars(select(FulfillmentJob).where(
+            FulfillmentJob.status.in_(["queued", "retry"]), FulfillmentJob.next_attempt_at <= now
+        ).order_by(FulfillmentJob.created_at).limit(20)).all()
+        ids = [job.invoice_id for job in jobs]
+        for job in jobs:
+            job.status = "processing"
+            job.claimed_at = now
+        db.commit()
+    for invoice_id in ids:
+        try:
+            with SessionLocal() as db:
+                job = db.get(FulfillmentJob, invoice_id)
+                already_notifying = bool(job and job.notification_pending)
+                telegram_id = job.telegram_id if job else None
+                product_type = job.product_type if job else "plan"
+            provision = "duplicate" if already_notifying else await provision_paid_invoice(invoice_id)
+            if provision is None:
+                raise RuntimeError("Связь оплаты с заказом пока не найдена")
+            if isinstance(provision, tuple):
+                telegram_id, link = provision
+                with SessionLocal() as db:
+                    job = db.get(FulfillmentJob, invoice_id)
+                    job.telegram_id = telegram_id
+                    job.product_type = product_type
+                    job.notification_pending = True
+                    db.commit()
+            else:
+                link = ""
+                if not telegram_id:
+                    raise RuntimeError("Не удалось определить получателя уведомления")
+                if product_type != "addon":
+                    with SessionLocal() as db:
+                        sub = db.get(Subscription, telegram_id)
+                        if sub:
+                            from app.services import happ_link
+                            link = happ_link(sub.sub_id)
+            if product_type == "addon":
+                message = "Оплата подтверждена! Лимит дополнительного трафика добавлен к вашей подписке."
+                keyboard = None
+            else:
+                bridge = happ_bridge_url(f"happ://add/{link}") if link else ""
+                message = ("Оплата подтверждена! Нажмите кнопку, чтобы открыть Happ и импортировать подписку."
+                           if bridge else f"Оплата подтверждена! Добавьте ссылку в Happ:\n{link}" if link
+                           else "Оплата подтверждена, подписка активирована.")
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Открыть подписку в Happ", url=bridge)]]) if bridge else None
+            await notify_user(int(telegram_id), message, reply_markup=keyboard)
+            with SessionLocal() as db:
+                job = db.get(FulfillmentJob, invoice_id)
+                if job:
+                    job.status = "done"
+                    job.notification_pending = False
+                    job.last_error = ""
+                    db.commit()
+        except Exception as exc:
+            with SessionLocal() as db:
+                job = db.get(FulfillmentJob, invoice_id)
+                if job:
+                    job.attempts += 1
+                    delay = min(3600, 30 * (2 ** min(job.attempts, 7)))
+                    job.status = "retry"
+                    job.next_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=delay)
+                    # Keep only a short, non-sensitive error class/message; never persist payment payloads or URLs.
+                    job.last_error = sanitized_error(exc)
+                    db.commit()
+
+
+async def reconcile_subscriptions():
+    """Compare the minimal stored subscription state to 3x-ui without storing panel payloads."""
+    checked_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        clients = await XUIClient().list_clients()
+        by_email = {str(item.get("email", "")): item for item in clients}
+        with SessionLocal() as db:
+            subscriptions = db.scalars(select(Subscription)).all()
+            global_inbounds = XUIClient._inbound_ids(get_config_map())
+            for sub in subscriptions:
+                remote = by_email.get(str(sub.telegram_id)) or by_email.get(f"sub-{sub.sub_id}@vpn.invalid")
+                target_inbounds = ({int(value) for value in sub.inbound_ids.split(",") if value.strip().isdigit()}
+                                   if sub.inbound_ids else set(global_inbounds))
+                if not remote:
+                    sub.sync_status = "client_missing"
+                elif bool(remote.get("enable", True)) != bool(sub.enabled):
+                    sub.sync_status = "enabled_differs"
+                elif abs(int(remote.get("expiryTime", 0) or 0) - int(as_utc(sub.expires_at).timestamp() * 1000)) > 120000:
+                    sub.sync_status = "expiry_differs"
+                elif sub.traffic_limit_bytes != int(remote.get("totalGB", 0) or 0):
+                    sub.sync_status = "traffic_differs"
+                elif sub.limit_hwid != int(remote.get("limitHwid", 0) or 0):
+                    sub.sync_status = "hwid_differs"
+                elif sub.traffic_reset != str(remote.get("trafficReset") or "never"):
+                    sub.sync_status = "traffic_reset_differs"
+                elif target_inbounds and set(remote.get("inboundIds") or []) != target_inbounds:
+                    sub.sync_status = "inbounds_differ"
+                else:
+                    sub.sync_status = "synced"
+                sub.sync_checked_at = checked_at
+            db.commit()
+    except Exception as exc:
+        with SessionLocal() as db:
+            db.query(Subscription).filter(Subscription.enabled.is_(True)).update(
+                {Subscription.sync_status: "check_error", Subscription.sync_checked_at: checked_at},
+                synchronize_session=False)
+            db.commit()
+        logger.warning("3x-ui reconciliation failed: %s", type(exc).__name__)
 
 
 async def restart_bot_runtime():
@@ -122,6 +256,12 @@ async def lifespan(app: FastAPI):
     init_runtime_config()
     scheduler.add_job(send_reminders, "interval", hours=6, id="reminders", replace_existing=True)
     scheduler.add_job(purge_old_pending_payments, "interval", hours=6, id="pending-retention", replace_existing=True)
+    scheduler.add_job(process_payment_jobs, "interval", seconds=15, id="payment-fulfillment", replace_existing=True,
+                      max_instances=1, coalesce=True)
+    scheduler.add_job(create_backup, "interval", hours=24, id="daily-backup", replace_existing=True,
+                      next_run_time=datetime.now(timezone.utc) + timedelta(minutes=1))
+    scheduler.add_job(reconcile_subscriptions, "interval", hours=24, id="3xui-reconciliation", replace_existing=True,
+                      next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2))
     scheduler.start()
     await restart_bot_runtime()
     yield
@@ -200,10 +340,16 @@ async def happ_open_bridge(token: str):
     if len(token) > 12000 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
         raise HTTPException(status_code=400, detail="Некорректная ссылка Happ")
     try:
-        padded = token + "=" * (-len(token) % 4)
-        target = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
-    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
-        raise HTTPException(status_code=400, detail="Некорректная ссылка Happ") from exc
+        target = decrypt_handoff(token)
+    except ValueError as exc:
+        # Keep already-delivered links working; newly generated handoffs are encrypted.
+        try:
+            padded = token + "=" * (-len(token) % 4)
+            target = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        except (ValueError, UnicodeDecodeError, binascii.Error):
+            raise HTTPException(status_code=400, detail="Некорректная ссылка Happ") from exc
+    if target.startswith("happ://routing/add/"):
+        target = target.replace("happ://routing/add/", "happ://routing/onadd/", 1)
     valid = False
     clipboard_value = ""
     if target.startswith("happ://add/"):
@@ -211,8 +357,8 @@ async def happ_open_bridge(token: str):
         parsed_subscription = urlsplit(subscription_url)
         valid = parsed_subscription.scheme == "https" and bool(parsed_subscription.netloc)
         clipboard_value = subscription_url
-    elif target.startswith("happ://routing/add/"):
-        route_data = target.removeprefix("happ://routing/add/")
+    elif target.startswith(("happ://routing/add/", "happ://routing/onadd/")):
+        route_data = unquote(target.removeprefix("happ://routing/onadd/").removeprefix("happ://routing/add/"))
         try:
             decoded = base64.b64decode(route_data, validate=True)
             json.loads(decoded)
@@ -239,8 +385,8 @@ const status=document.getElementById('status');
 document.getElementById('handoff').addEventListener('click',async()=>{{
   const field=document.getElementById('copy-value');field.focus();field.select();
   let copied=false;try{{copied=document.execCommand('copy')}}catch{{}}
-  if(!copied&&navigator.clipboard){{try{{await navigator.clipboard.writeText(field.value);copied=true}}catch{{}}}}
-  status.textContent=copied?'Ссылка скопирована. Открываем Happ…':'Не удалось скопировать автоматически. Открываем Happ; если нужно, скопируйте ссылку вручную.';
+  if(!copied&&navigator.clipboard){{navigator.clipboard.writeText(field.value).then(()=>{{status.textContent='Ссылка скопирована. Открываем Happ…'}}).catch(()=>{{}})}}
+  status.textContent=copied?'Ссылка скопирована. Открываем Happ…':'Открываем Happ…';
   window.location.href=target;
 }});
 </script></body></html>"""
@@ -263,17 +409,19 @@ async def lava_webhook(request: Request):
         invoice_id = str(payload.get("contractId") or payload.get("invoiceId") or "")
         if not invoice_id:
             raise HTTPException(status_code=400, detail="Missing invoice reference")
-        provision = await provision_paid_invoice(invoice_id)
-        if provision == "duplicate":
-            return {"ok": True, "duplicate": True}
-        if not provision:
-            raise HTTPException(status_code=503, detail="Payment mapping is not ready")
-        telegram_id, link = provision
-        if link:
-            message = f"Оплата подтверждена! Ваша подписка для Happ:\n\n{link}\n\nДобавьте ссылку в Happ через «Добавить по ссылке»."
-        else:
-            message = "Оплата подтверждена! Лимит дополнительного трафика добавлен к вашей подписке."
-        await notify_user(telegram_id, message)
+        with SessionLocal() as db:
+            payment = db.get(PendingPayment, invoice_id)
+            if not payment:
+                if db.get(FulfillmentJob, invoice_id) or db.get(ProcessedPayment, hashlib.sha256(invoice_id.encode()).hexdigest()):
+                    return {"ok": True, "duplicate": True}
+                raise HTTPException(status_code=503, detail="Payment mapping is not ready")
+            existing = db.get(FulfillmentJob, invoice_id)
+            if existing:
+                return {"ok": True, "duplicate": True}
+            db.add(FulfillmentJob(invoice_id=invoice_id, status="queued", telegram_id=payment.telegram_id,
+                                  product_type=payment.product_type))
+            db.commit()
+        return {"ok": True, "queued": True}
     return {"ok": True}
 
 
@@ -371,7 +519,17 @@ async def admin_page(section: str, request: Request, _: None = Depends(admin)):
             ctx.update(menu_rows=menu_rows, menu_labels=menu_labels, bot_welcome_text=get_config("bot_welcome_text"),
                        offer_text=get_config("offer_text"), public_base_url=get_config("public_base_url"))
         elif section == "system":
-            ctx.update(control_enabled=bool(env_settings.control_api_token), operation=request.query_params.get("operation", ""))
+            backups = sorted(backup_directory().glob("vpnshop-*.vpbak"), key=lambda p: p.stat().st_mtime, reverse=True)
+            sync_issues = db.scalars(select(Subscription).where(
+                Subscription.sync_status.notin_(["synced", "unknown"])
+            ).order_by(Subscription.sync_checked_at.desc()).limit(100)).all()
+            payment_issues = db.scalars(select(FulfillmentJob).where(
+                FulfillmentJob.status != "done"
+            ).order_by(FulfillmentJob.created_at.desc()).limit(50)).all()
+            ctx.update(control_enabled=bool(env_settings.control_api_token), operation=request.query_params.get("operation", ""),
+                       backup_files=[{"name": p.name, "size": p.stat().st_size} for p in backups[:14]],
+                       backup_key_configured=bool(env_settings.backup_encryption_key), sync_issues=sync_issues,
+                       payment_issues=payment_issues)
         return templates.TemplateResponse(request, "admin_base.html", ctx | {"section_body": f"admin_{section}.html"})
 
 
@@ -579,8 +737,54 @@ async def system_restart(request: Request, _: None = Depends(admin)):
 @app.post("/admin/system/update")
 async def system_update(request: Request, _: None = Depends(admin)):
     await checked_form(request)
+    try:
+        await asyncio.to_thread(create_backup)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Обновление остановлено: резервная копия не создана: {exc}") from exc
     await call_control_api("POST", "/update", timeout=900)
     return RedirectResponse("/admin/system?operation=updating", status_code=303)
+
+
+@app.post("/admin/system/backup")
+async def system_backup(request: Request, _: None = Depends(admin)):
+    await checked_form(request)
+    try:
+        path = await asyncio.to_thread(create_backup)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Резервная копия не создана: {exc}") from exc
+    return RedirectResponse("/admin/system?backup=created", status_code=303)
+
+
+@app.post("/admin/system/reconcile")
+async def system_reconcile(request: Request, _: None = Depends(admin)):
+    await checked_form(request)
+    await reconcile_subscriptions()
+    return RedirectResponse("/admin/system?reconciled=1", status_code=303)
+
+
+@app.post("/admin/system/payments/{invoice_id}/retry")
+async def retry_payment_job(invoice_id: str, request: Request, _: None = Depends(admin)):
+    await checked_form(request)
+    with SessionLocal() as db:
+        job = db.get(FulfillmentJob, invoice_id)
+        if not job or job.status != "retry":
+            raise HTTPException(status_code=404)
+        job.status = "queued"
+        job.next_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        job.last_error = ""
+        db.commit()
+    return RedirectResponse("/admin/system?payments=retry", status_code=303)
+
+
+@app.get("/admin/system/backup/{filename}")
+async def download_backup(filename: str, _: None = Depends(admin)):
+    from fastapi.responses import FileResponse
+    if not re.fullmatch(r"vpnshop-[0-9]{8}-[0-9]{6}(?:-[0-9]{6})?\.vpbak", filename):
+        raise HTTPException(status_code=404)
+    path = backup_directory() / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404)
+    return FileResponse(path, filename=filename, media_type="application/octet-stream")
 
 
 @app.post("/admin/botmenu/content")

@@ -4,18 +4,19 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import httpx
+from sqlalchemy import select
 from app.config import settings as env_settings
 from app.db import SessionLocal, Plan, AddonPackage, PendingPayment, Subscription, SubscriptionHistory, ProcessedPayment
 from app.runtime_config import get_config_map
 
 
 class LavaClient:
-    async def create_invoice(self, telegram_id: int, plan: Plan) -> tuple[str, str]:
+    async def create_invoice(self, telegram_id: int, plan: Plan, amount: int | None = None) -> tuple[str, str]:
         cfg = get_config_map()
         if not cfg["lava_api_key"] or not cfg["lava_offer_id"]:
             raise RuntimeError("Не настроены LAVA_API_KEY и LAVA_OFFER_ID")
         # Lava's invoice API accepts an email field; use a random non-routable alias, not Telegram ID.
-        payload = {"offerId": cfg["lava_offer_id"], "amount": plan.amount, "currency": plan.currency,
+        payload = {"offerId": cfg["lava_offer_id"], "amount": plan.amount if amount is None else amount, "currency": plan.currency,
                    "email": f"{uuid.uuid4().hex}@users.invalid"}
         if cfg["lava_payment_provider"]:
             payload["paymentProvider"] = cfg["lava_payment_provider"]
@@ -183,6 +184,38 @@ class XUIClient:
             return [{"id": int(item["id"]), "name": str(item.get("remark") or item.get("tag") or f"Inbound {item['id']}"),
                      "protocol": str(item.get("protocol", "")), "port": int(item.get("port") or 0)} for item in items]
 
+    async def list_clients(self) -> list[dict]:
+        cfg = get_config_map()
+        base = cfg["xui_base_url"].rstrip("/")
+        api = base + "/" + cfg["xui_api_base_path"].strip("/")
+        headers = {"Authorization": f"Bearer {cfg['xui_api_token']}"} if cfg["xui_api_token"] else {}
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            if not cfg["xui_api_token"]:
+                response = await client.post(f"{base}/{cfg['xui_login_path'].lstrip('/')}",
+                                              data={"username": cfg["xui_username"], "password": cfg["xui_password"]})
+                response.raise_for_status()
+            response = await client.get(f"{api}/inbounds/list", headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("success") is False:
+                raise RuntimeError("3x-ui rejected the client list request")
+            inbounds = data.get("obj") or []
+            clients: dict[str, dict] = {}
+            for inbound in inbounds:
+                try:
+                    settings = inbound.get("settings") or {}
+                    settings = json.loads(settings) if isinstance(settings, str) else settings
+                    inbound_id = int(inbound.get("id", 0))
+                    for item in settings.get("clients", []):
+                        email = str(item.get("email", ""))
+                        if not email:
+                            continue
+                        entry = clients.setdefault(email, dict(item, inboundIds=[]))
+                        entry["inboundIds"].append(inbound_id)
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    continue
+            return list(clients.values())
+
     async def client_usage(self, sub_id: str, telegram_id: int | None = None) -> int:
         cfg = get_config_map()
         base = cfg["xui_base_url"].rstrip("/")
@@ -264,6 +297,36 @@ def happ_link(sub_id: str) -> str:
     return f"{base}/{path}/{quote(sub_id)}"
 
 
+def quote_immediate_switch(db, telegram_id: int, plan: Plan, now: datetime | None = None) -> tuple[int, int, int]:
+    """Return charge, same-currency unused-value credit and rounded-up service days."""
+    now = now or datetime.now(timezone.utc)
+    sub = db.get(Subscription, telegram_id)
+    credit = 0
+    if sub and sub.enabled and sub.currency == plan.currency:
+        rows = db.scalars(select(SubscriptionHistory).where(
+            SubscriptionHistory.telegram_id == telegram_id,
+            SubscriptionHistory.expires_at > now.replace(tzinfo=None)
+        )).all()
+        for row in rows:
+            if row.currency != plan.currency:
+                continue
+            start = row.starts_at.replace(tzinfo=timezone.utc) if row.starts_at.tzinfo is None else row.starts_at
+            end = row.expires_at.replace(tzinfo=timezone.utc) if row.expires_at.tzinfo is None else row.expires_at
+            begin = max(now, start)
+            finish = max(begin, end)
+            whole = max(1.0, (end - start).total_seconds())
+            remaining = max(0.0, (finish - begin).total_seconds())
+            credit += int(row.price * min(1.0, remaining / whole))
+    price = max(0, int(plan.amount))
+    charge = max(0, price - credit)
+    if price == 0:
+        return 0, credit, max(1, int(plan.days))
+    value = max(price, credit)
+    seconds = max(1, int(plan.days * 86400 * value / max(1, price)))
+    days = max(1, (seconds + 86399) // 86400)
+    return charge, credit, days
+
+
 async def provision_paid_invoice(invoice_id: str) -> tuple[int, str] | str | None:
     with SessionLocal() as db:
         invoice_hash = hashlib.sha256(invoice_id.encode()).hexdigest()
@@ -297,41 +360,59 @@ async def provision_paid_invoice(invoice_id: str) -> tuple[int, str] | str | Non
         plan = db.get(Plan, plan_id)
         if not plan:
             return None
+        has_snapshot = payment.plan_days_snapshot > 0
+        plan_name = payment.plan_name_snapshot if has_snapshot else plan.name
+        plan_amount = payment.plan_amount_snapshot if has_snapshot else plan.amount
+        plan_currency = payment.plan_currency_snapshot if has_snapshot else plan.currency
+        plan_days = payment.plan_days_snapshot if has_snapshot else plan.days
+        plan_traffic_gb = payment.plan_traffic_gb_snapshot if has_snapshot else plan.traffic_limit_gb
+        plan_hwid = payment.plan_hwid_snapshot if has_snapshot else plan.limit_hwid
+        plan_reset = payment.plan_reset_snapshot if has_snapshot else plan.traffic_reset
         now = datetime.now(timezone.utc)
+        immediate_switch = bool(payment.immediate_switch)
         current_exp = current.expires_at.replace(tzinfo=timezone.utc) if current and current.expires_at.tzinfo is None else (current.expires_at if current else now)
-        starts_at = max(now, current_exp)
-        expires = starts_at + timedelta(days=plan.days)
+        starts_at = now if immediate_switch else max(now, current_exp)
+        service_days = max(1, int(payment.switch_days or plan_days))
+        expires = starts_at + timedelta(days=service_days)
         sub_id = current.sub_id if current else uuid.uuid4().hex[:20]
-        plan_bytes = int(plan.traffic_limit_gb * (1024 ** 3))
+        plan_bytes = int(plan_traffic_gb * (1024 ** 3))
         new_traffic_limit = plan_bytes
         configured_inbounds = XUIClient._inbound_ids(get_config_map())
         await XUIClient().add_or_update_client(telegram_id, sub_id, int(expires.timestamp() * 1000),
                                                new_traffic_limit, exists=current is not None,
-                                               limit_hwid=plan.limit_hwid, traffic_reset=plan.traffic_reset,
-                                               inbound_ids=configured_inbounds, group_name=plan.name)
-        if current:
-            await XUIClient().reset_client_traffic(sub_id, telegram_id)
+                                               limit_hwid=plan_hwid, traffic_reset=plan_reset,
+                                               inbound_ids=configured_inbounds, group_name=plan_name)
+        if current and immediate_switch:
+            # The user is moved now, so unused old periods cannot be credited a second time.
+            for row in db.scalars(select(SubscriptionHistory).where(
+                SubscriptionHistory.telegram_id == telegram_id,
+                SubscriptionHistory.expires_at > now.replace(tzinfo=None)
+            )).all():
+                row_start = row.starts_at.replace(tzinfo=timezone.utc) if row.starts_at.tzinfo is None else row.starts_at
+                row.expires_at = (row.starts_at if row_start >= now else now.replace(tzinfo=None))
+            # Keep traffic counters intact so retrying a webhook cannot erase usage twice.
         if current:
             current.expires_at = expires
             current.plan_id = plan.id
             current.enabled = True
             current.reminded = ""
-            current.plan_name = plan.name
-            current.current_price = plan.amount
-            current.currency = plan.currency
+            current.plan_name = plan_name
+            current.current_price = plan_amount
+            current.currency = plan_currency
             current.traffic_limit_bytes = new_traffic_limit
-            current.limit_hwid = plan.limit_hwid
-            current.traffic_reset = plan.traffic_reset
+            current.limit_hwid = plan_hwid
+            current.traffic_reset = plan_reset
             current.inbound_ids = ",".join(str(value) for value in configured_inbounds)
         else:
             db.add(Subscription(telegram_id=telegram_id, sub_id=sub_id, expires_at=expires, enabled=True,
                                 plan_id=plan.id,
-                                plan_name=plan.name, current_price=plan.amount, currency=plan.currency,
-                                traffic_limit_bytes=new_traffic_limit, limit_hwid=plan.limit_hwid,
-                                traffic_reset=plan.traffic_reset,
+                                plan_name=plan_name, current_price=plan_amount, currency=plan_currency,
+                                traffic_limit_bytes=new_traffic_limit, limit_hwid=plan_hwid,
+                                traffic_reset=plan_reset,
                                 inbound_ids=",".join(str(value) for value in configured_inbounds)))
-        db.add(SubscriptionHistory(telegram_id=telegram_id, plan_name=plan.name, plan_days=plan.days,
-                                   price=plan.amount, currency=plan.currency, traffic_limit_bytes=plan_bytes,
+        history_value = (payment.charged_amount + payment.credit_amount) if immediate_switch else (payment.charged_amount or plan_amount)
+        db.add(SubscriptionHistory(telegram_id=telegram_id, plan_name=plan_name, plan_days=service_days,
+                                   price=history_value, currency=plan_currency, traffic_limit_bytes=plan_bytes,
                                    starts_at=starts_at.replace(tzinfo=None), expires_at=expires.replace(tzinfo=None)))
         db.add(ProcessedPayment(payment_hash=invoice_hash))
         db.delete(payment)

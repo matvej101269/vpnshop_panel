@@ -3,6 +3,7 @@ import base64
 import ipaddress
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import AsyncGenerator, Optional
 from aiogram import Bot, Dispatcher, F
@@ -16,8 +17,8 @@ from aiogram.utils.backoff import Backoff, BackoffConfig
 from urllib.parse import quote, urlsplit
 from sqlalchemy import select
 from app.db import SessionLocal, Plan, AddonPackage, PendingPayment, BotMenuNode, Subscription
-from app.services import LavaClient, XUIClient, happ_link
-from app.runtime_config import get_config
+from app.services import LavaClient, XUIClient, happ_link, quote_immediate_switch, provision_paid_invoice
+from app.runtime_config import get_config, encrypt_handoff
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,9 @@ def is_public_http_url(value: str) -> bool:
 
 
 def routing_deep_link(rules: str) -> str:
-    prefix = "happ://routing/add/"
+    prefix = "happ://routing/onadd/"
+    if rules.startswith("happ://routing/add/"):
+        return rules.replace("happ://routing/add/", prefix, 1)
     if rules.startswith(prefix):
         return rules
     compact = json.dumps(json.loads(rules), ensure_ascii=False, separators=(",", ":"))
@@ -91,7 +94,7 @@ def happ_bridge_url(deep_link: str) -> str:
     base = get_config("public_base_url").rstrip("/")
     if urlsplit(base).scheme != "https" or not is_public_http_url(base):
         return ""
-    token = base64.urlsafe_b64encode(deep_link.encode("utf-8")).decode("ascii").rstrip("=")
+    token = encrypt_handoff(deep_link)
     return f"{base}/happ/open/{token}"
 
 
@@ -141,7 +144,8 @@ async def show_menu(target, parent_id: int | None):
             text = node.text or node.label
             if node.action in {"plans", "change_plan"}:
                 plans = db.scalars(select(Plan).where(Plan.enabled.is_(True), Plan.show_in_bot.is_(True))).all()
-                rows = [[InlineKeyboardButton(text=f"{p.name} — {p.amount} {p.currency}", callback_data=f"buy:{p.id}")]
+                action = "switch" if node.action == "change_plan" else "buy"
+                rows = [[InlineKeyboardButton(text=f"{p.name} — {p.amount} {p.currency}", callback_data=f"{action}:{p.id}")]
                         for p in plans]
                 rows.append([InlineKeyboardButton(text="‹ Назад", callback_data=f"menu:{node.parent_id or 0}")])
                 keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
@@ -241,20 +245,69 @@ async def open_menu(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("buy:"))
 async def buy(callback: CallbackQuery):
+    await create_plan_order(callback, immediate_switch=False)
+
+
+@dp.callback_query(F.data.startswith("switch:"))
+async def switch_plan(callback: CallbackQuery):
+    await create_plan_order(callback, immediate_switch=True)
+
+
+async def create_plan_order(callback: CallbackQuery, immediate_switch: bool):
     plan_id = int(callback.data.split(":", 1)[1])
     try:
+        switch_now = immediate_switch
         with SessionLocal() as db:
             plan = db.get(Plan, plan_id)
             if not plan or not plan.enabled or not plan.show_in_bot:
                 await callback.answer("Тариф недоступен", show_alert=True)
                 return
-        invoice_id, pay_url = await LavaClient().create_invoice(callback.from_user.id, plan)
+            current = db.get(Subscription, callback.from_user.id)
+            current_expiry = (current.expires_at.replace(tzinfo=timezone.utc) if current and current.expires_at.tzinfo is None
+                              else (current.expires_at if current else None))
+            if (current and current.enabled and current_expiry and current_expiry > datetime.now(timezone.utc)
+                    and current.plan_id and current.plan_id != plan.id):
+                switch_now = True
+            if switch_now and db.scalar(select(PendingPayment).where(
+                PendingPayment.telegram_id == callback.from_user.id,
+                PendingPayment.immediate_switch.is_(True)
+            )):
+                await callback.answer("У вас уже есть неоплаченная смена тарифа. Завершите оплату или дождитесь отмены счёта.", show_alert=True)
+                return
+            charge, credit, service_days = quote_immediate_switch(db, callback.from_user.id, plan) if switch_now else (plan.amount, 0, plan.days)
+            snapshot = {"plan_name_snapshot": plan.name, "plan_amount_snapshot": plan.amount,
+                        "plan_currency_snapshot": plan.currency, "plan_days_snapshot": plan.days,
+                        "plan_traffic_gb_snapshot": plan.traffic_limit_gb,
+                        "plan_hwid_snapshot": plan.limit_hwid, "plan_reset_snapshot": plan.traffic_reset}
+        if switch_now and charge == 0:
+            invoice_id = "credit-" + uuid.uuid4().hex
+            with SessionLocal() as db:
+                db.add(PendingPayment(invoice_id=invoice_id, telegram_id=callback.from_user.id, plan_id=plan_id,
+                                      product_type="plan", charged_amount=0, credit_amount=credit, immediate_switch=True,
+                                      switch_days=service_days, **snapshot))
+                db.commit()
+            result = await provision_paid_invoice(invoice_id)
+            await callback.message.answer(f"Тариф изменён сразу. Остаток зачтён; новый срок — {service_days} дн.")
+            if isinstance(result, tuple) and result[1]:
+                bridge = happ_bridge_url(f"happ://add/{result[1]}")
+                if bridge:
+                    await callback.message.answer("Откройте новую подписку в Happ:", reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(text="Открыть подписку в Happ", url=bridge)]]))
+                else:
+                    await callback.message.answer("Ссылка для Happ:\n" + result[1])
+            await callback.answer()
+            return
+        invoice_id, pay_url = await LavaClient().create_invoice(callback.from_user.id, plan, charge)
         with SessionLocal() as db:
             db.add(PendingPayment(invoice_id=invoice_id, telegram_id=callback.from_user.id,
-                                  plan_id=plan_id, product_type="plan"))
+                                  plan_id=plan_id, product_type="plan", charged_amount=charge,
+                                  credit_amount=credit, immediate_switch=switch_now,
+                                  switch_days=service_days if switch_now else 0, **snapshot))
             db.commit()
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Оплатить", url=pay_url)]])
-        await callback.message.answer("Счёт создан. После подтверждения оплаты бот пришлёт ссылку для Happ.", reply_markup=keyboard)
+        description = (f"Смена тарифа сейчас. К оплате {charge} {plan.currency}; учтено остатка: {credit} {plan.currency}." if switch_now
+                       else "Счёт создан. После подтверждения оплаты бот пришлёт ссылку для Happ.")
+        await callback.message.answer(description, reply_markup=keyboard)
         await callback.answer()
     except Exception:
         await callback.answer("Не удалось создать счёт. Попробуйте позже.", show_alert=True)
@@ -306,12 +359,12 @@ async def start_bot(token: str):
         delay = min(delay * 2, 300)
 
 
-async def notify_user(telegram_id: int, text: str):
+async def notify_user(telegram_id: int, text: str, reply_markup=None):
     token = get_config("bot_token")
     if not token:
-        return
+        raise RuntimeError("Telegram bot token is not configured")
     bot = Bot(token)
     try:
-        await bot.send_message(telegram_id, text)
+        await bot.send_message(telegram_id, text, reply_markup=reply_markup)
     finally:
         await bot.session.close()

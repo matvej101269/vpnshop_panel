@@ -75,6 +75,19 @@ def _fernet() -> Fernet:
         raise RuntimeError("Cannot read the app secret-encryption key") from exc
 
 
+def encrypt_handoff(value: str) -> str:
+    """Encrypt a short-lived Happ deep link so it never appears in proxy URLs/logs."""
+    return _fernet().encrypt(value.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decrypt_handoff(token: str) -> str:
+    padded = token + "=" * (-len(token) % 4)
+    try:
+        return _fernet().decrypt(padded.encode("ascii")).decode("utf-8")
+    except (InvalidToken, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("Invalid or expired Happ handoff") from exc
+
+
 def make_csrf_token(username: str) -> str:
     key = base64.urlsafe_b64decode(_key_path().read_bytes().strip())
     timestamp = str(int(time.time()))

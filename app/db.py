@@ -56,6 +56,17 @@ class PendingPayment(Base):
     product_type: Mapped[str] = mapped_column(String(16), default="plan")
     package_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     package_traffic_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    charged_amount: Mapped[int] = mapped_column(Integer, default=0)
+    credit_amount: Mapped[int] = mapped_column(Integer, default=0)
+    immediate_switch: Mapped[bool] = mapped_column(Boolean, default=False)
+    switch_days: Mapped[int] = mapped_column(Integer, default=0)
+    plan_name_snapshot: Mapped[str] = mapped_column(String(100), default="")
+    plan_amount_snapshot: Mapped[int] = mapped_column(Integer, default=0)
+    plan_currency_snapshot: Mapped[str] = mapped_column(String(8), default="")
+    plan_days_snapshot: Mapped[int] = mapped_column(Integer, default=0)
+    plan_traffic_gb_snapshot: Mapped[float] = mapped_column(Float, default=0)
+    plan_hwid_snapshot: Mapped[int] = mapped_column(Integer, default=0)
+    plan_reset_snapshot: Mapped[str] = mapped_column(String(16), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -74,6 +85,22 @@ class Subscription(Base):
     inbound_ids: Mapped[str] = mapped_column(Text, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     reminded: Mapped[str] = mapped_column(String(100), default="")
+    sync_status: Mapped[str] = mapped_column(String(24), default="unknown")
+    sync_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class FulfillmentJob(Base):
+    __tablename__ = "fulfillment_jobs"
+    invoice_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(String(500), default="")
+    notification_pending: Mapped[bool] = mapped_column(Boolean, default=False)
+    telegram_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    product_type: Mapped[str] = mapped_column(String(16), default="plan")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class SubscriptionHistory(Base):
@@ -151,6 +178,17 @@ def init_db():
                 "product_type": "VARCHAR(16) NOT NULL DEFAULT 'plan'",
                 "package_id": "INTEGER",
                 "package_traffic_bytes": "INTEGER NOT NULL DEFAULT 0",
+                "charged_amount": "INTEGER NOT NULL DEFAULT 0",
+                "credit_amount": "INTEGER NOT NULL DEFAULT 0",
+                "immediate_switch": "BOOLEAN NOT NULL DEFAULT 0",
+                "switch_days": "INTEGER NOT NULL DEFAULT 0",
+                "plan_name_snapshot": "VARCHAR(100) NOT NULL DEFAULT ''",
+                "plan_amount_snapshot": "INTEGER NOT NULL DEFAULT 0",
+                "plan_currency_snapshot": "VARCHAR(8) NOT NULL DEFAULT ''",
+                "plan_days_snapshot": "INTEGER NOT NULL DEFAULT 0",
+                "plan_traffic_gb_snapshot": "FLOAT NOT NULL DEFAULT 0",
+                "plan_hwid_snapshot": "INTEGER NOT NULL DEFAULT 0",
+                "plan_reset_snapshot": "VARCHAR(16) NOT NULL DEFAULT ''",
             },
             "subscriptions": {
                 "plan_id": "INTEGER",
@@ -161,6 +199,8 @@ def init_db():
                 "limit_hwid": "INTEGER NOT NULL DEFAULT 0",
                 "traffic_reset": "VARCHAR(16) NOT NULL DEFAULT 'never'",
                 "inbound_ids": "TEXT NOT NULL DEFAULT ''",
+                "sync_status": "VARCHAR(24) NOT NULL DEFAULT 'unknown'",
+                "sync_checked_at": "DATETIME",
             },
             "subscription_history": {
                 "price": "INTEGER NOT NULL DEFAULT 0",
@@ -176,6 +216,11 @@ def init_db():
                 for name, definition in columns.items():
                     if name not in existing:
                         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
+            if "pending_payments" in set(inspect(engine).get_table_names()):
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_immediate_switch_user "
+                    "ON pending_payments (telegram_id) WHERE immediate_switch = 1"
+                ))
             if "bot_buttons" in set(inspect(engine).get_table_names()):
                 conn.execute(text("DROP TABLE bot_buttons"))
     with SessionLocal() as db:
