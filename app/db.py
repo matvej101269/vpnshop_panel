@@ -83,6 +83,7 @@ class Subscription(Base):
     limit_hwid: Mapped[int] = mapped_column(Integer, default=0)
     traffic_reset: Mapped[str] = mapped_column(String(16), default="never")
     inbound_ids: Mapped[str] = mapped_column(Text, default="")
+    routing_rules: Mapped[str] = mapped_column(Text, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     reminded: Mapped[str] = mapped_column(String(100), default="")
     sync_status: Mapped[str] = mapped_column(String(24), default="unknown")
@@ -199,6 +200,7 @@ def init_db():
                 "limit_hwid": "INTEGER NOT NULL DEFAULT 0",
                 "traffic_reset": "VARCHAR(16) NOT NULL DEFAULT 'never'",
                 "inbound_ids": "TEXT NOT NULL DEFAULT ''",
+                "routing_rules": "TEXT NOT NULL DEFAULT ''",
                 "sync_status": "VARCHAR(24) NOT NULL DEFAULT 'unknown'",
                 "sync_checked_at": "DATETIME",
             },

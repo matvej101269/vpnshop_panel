@@ -107,11 +107,9 @@ def menu_keyboard(db, parent_id: int | None, include_back: bool = True, telegram
         if node.action == "url":
             rows.append([InlineKeyboardButton(text=node.label, url=node.url)])
         elif node.action == "routing" and node.routing_rules:
-            link = happ_bridge_url(routing_deep_link(node.routing_rules))
-            if len(link) <= 4096:
-                rows.append([InlineKeyboardButton(text=node.label, url=link)])
-            else:
-                rows.append([InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}")])
+            # Route actions need a callback first: it associates the profile with
+            # the user's active subscription before generating its Happ URL.
+            rows.append([InlineKeyboardButton(text=node.label, callback_data=f"menu:{node.id}")])
         elif node.action == "open_happ" and telegram_id is not None:
             sub = db.get(Subscription, telegram_id)
             expiry = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
@@ -204,12 +202,23 @@ async def show_menu(target, parent_id: int | None):
                     keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
             elif node.action == "routing":
                 back_keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
-                route_link = happ_bridge_url(routing_deep_link(node.routing_rules)) if node.routing_rules else ""
-                rows = [[InlineKeyboardButton(text="Добавить правила в Happ", url=route_link)]] if route_link and len(route_link) <= 4096 else []
+                sub = db.get(Subscription, telegram_id)
+                expires = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
+                active = bool(sub and sub.enabled and expires and expires > datetime.now(timezone.utc))
+                if active and node.routing_rules:
+                    # Persist only as subscription configuration, so the same
+                    # stable Happ URL can update the already-imported subscription.
+                    sub.routing_rules = node.routing_rules
+                    db.commit()
+                    link = happ_link(sub.sub_id)
+                    route_link = happ_bridge_url(f"happ://add/{link}") if link.startswith("https://") else ""
+                else:
+                    route_link = ""
+                rows = [[InlineKeyboardButton(text="Применить правила к подписке в Happ", url=route_link)]] if route_link and len(route_link) <= 4096 else []
                 rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
                 keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
-                text = node.text or ("Нажмите кнопку, чтобы добавить профиль маршрутизации в Happ." if route_link and len(route_link) <= 4096 else
-                                     "Профиль маршрутизации слишком большой или не настроен.")
+                text = node.text or ("Профиль будет привязан к вашей подписке. Нажмите кнопку, чтобы обновить её в Happ." if route_link and len(route_link) <= 4096 else
+                                     "Для применения маршрутов нужна активная подписка и настроенный публичный HTTPS-адрес панели.")
             else:
                 keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
         if parent_id is None and not keyboard:

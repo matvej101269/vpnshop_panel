@@ -294,8 +294,16 @@ class XUIClient:
 
 def happ_link(sub_id: str) -> str:
     cfg = get_config_map()
-    # Happ subscription URLs end with the subscription ID directly; adding a
-    # configurable `/sub` segment breaks the panel's subscription endpoint.
+    # Use a stable VPN Shop URL so Happ can receive per-subscription routing
+    # metadata from the response headers while fetching the upstream 3x-ui feed.
+    base = cfg["public_base_url"].rstrip("/")
+    if not base:
+        return ""
+    return f"{base}/happ/sub/{quote(sub_id)}"
+
+
+def upstream_happ_link(sub_id: str) -> str:
+    cfg = get_config_map()
     base = cfg["happ_subscription_base"].rstrip("/")
     return f"{base}/{quote(sub_id)}"
 

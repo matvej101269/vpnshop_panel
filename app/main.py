@@ -2,7 +2,6 @@ import asyncio
 import base64
 import binascii
 import json
-import html
 import hashlib
 import logging
 import re
@@ -14,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from collections import Counter
 from fastapi import FastAPI, Request, Depends, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import httpx
@@ -24,9 +23,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.config import settings as env_settings
 from app.db import (init_db, SessionLocal, Plan, AddonPackage, BotMenuNode, PendingPayment, FulfillmentJob, ProcessedPayment, Subscription,
                     SubscriptionHistory, AdminAccount)
-from app.services import provision_paid_invoice, XUIClient
+from app.services import provision_paid_invoice, XUIClient, happ_link, upstream_happ_link
 from app.backups import create_backup, backup_directory
-from app.bot import start_bot, notify_user, happ_bridge_url
+from app.bot import start_bot, notify_user, happ_bridge_url, routing_deep_link
 from app.runtime_config import (init_runtime_config, get_config, save_config, config_status,
                                 verify_admin, save_admin_account, CONFIG_DEFAULTS, SECRET_KEYS,
                                 make_csrf_token, verify_csrf_token, get_config_map,
@@ -336,7 +335,7 @@ async def health():
 
 @app.get("/happ/open/{token}", response_class=HTMLResponse)
 async def happ_open_bridge(token: str):
-    """HTTPS handoff page: copy import data, then launch Happ from a user gesture."""
+    """HTTPS handoff page that immediately tries the Happ app link, with a manual fallback."""
     if len(token) > 12000 or not re.fullmatch(r"[A-Za-z0-9_-]+", token):
         raise HTTPException(status_code=400, detail="Некорректная ссылка Happ")
     try:
@@ -351,46 +350,67 @@ async def happ_open_bridge(token: str):
     if target.startswith("happ://routing/add/"):
         target = target.replace("happ://routing/add/", "happ://routing/onadd/", 1)
     valid = False
-    clipboard_value = ""
     if target.startswith("happ://add/"):
         subscription_url = target.removeprefix("happ://add/")
         parsed_subscription = urlsplit(subscription_url)
         valid = parsed_subscription.scheme == "https" and bool(parsed_subscription.netloc)
-        clipboard_value = subscription_url
     elif target.startswith(("happ://routing/add/", "happ://routing/onadd/")):
         route_data = unquote(target.removeprefix("happ://routing/onadd/").removeprefix("happ://routing/add/"))
         try:
             decoded = base64.b64decode(route_data, validate=True)
             json.loads(decoded)
             valid = bool(decoded) and len(decoded) <= 8000
-            clipboard_value = target
         except (ValueError, json.JSONDecodeError, binascii.Error):
             valid = False
     if not valid:
         raise HTTPException(status_code=400, detail="Неподдерживаемая ссылка Happ")
-    escaped_target = html.escape(target, quote=True)
-    escaped_clipboard = html.escape(clipboard_value, quote=True)
     js_target = json.dumps(target, ensure_ascii=True).replace("<", "\\u003c")
     page = f"""<!doctype html><html lang="ru"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Открыть Happ</title>
 <body style="font:16px system-ui;max-width:520px;margin:12vh auto;padding:24px;text-align:center;background:#10151d;color:#eef2f7">
-<h2>Импорт в Happ</h2><p>Скопируем данные в буфер и попробуем открыть приложение.</p>
-<button id="handoff" style="border:0;padding:14px 22px;border-radius:10px;background:#19a974;color:white;font-size:16px">Скопировать и открыть Happ</button>
-<p id="status" aria-live="polite" style="color:#aab5c3"></p>
-<p><a style="color:#8ab4ff" href="{escaped_target}">Открыть Happ без копирования</a></p>
-<textarea id="copy-value" readonly style="position:fixed;left:-10000px;top:0">{escaped_clipboard}</textarea>
+<h2>Открываем Happ</h2><p id="status" aria-live="polite" style="color:#aab5c3">Пробуем открыть приложение и импортировать подписку…</p>
+<p><a id="manual" style="color:#8ab4ff" href="#">Если Happ не открылся, нажмите здесь</a></p>
 <script>
 const target={js_target};
-const status=document.getElementById('status');
-document.getElementById('handoff').addEventListener('click',async()=>{{
-  const field=document.getElementById('copy-value');field.focus();field.select();
-  let copied=false;try{{copied=document.execCommand('copy')}}catch{{}}
-  if(!copied&&navigator.clipboard){{navigator.clipboard.writeText(field.value).then(()=>{{status.textContent='Ссылка скопирована. Открываем Happ…'}}).catch(()=>{{}})}}
-  status.textContent=copied?'Ссылка скопирована. Открываем Happ…':'Открываем Happ…';
-  window.location.href=target;
-}});
+document.getElementById('manual').href=target;
+window.setTimeout(()=>{{window.location.href=target}},80);
+window.setTimeout(()=>{{document.getElementById('status').textContent='Если приложение не открылось автоматически, используйте ссылку ниже.'}},1400);
 </script></body></html>"""
     return HTMLResponse(page, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
+@app.get("/happ/sub/{sub_id}")
+async def happ_subscription_proxy(sub_id: str, request: Request):
+    """Proxy a single 3x-ui subscription and attach its Happ routing profile."""
+    with SessionLocal() as db:
+        sub = db.scalar(select(Subscription).where(Subscription.sub_id == sub_id))
+        if not sub:
+            raise HTTPException(status_code=404, detail="Подписка не найдена")
+        routing_rules = sub.routing_rules
+    upstream_url = upstream_happ_link(sub_id)
+    upstream = urlsplit(upstream_url)
+    if upstream.scheme != "https" or not upstream.netloc:
+        raise HTTPException(status_code=503, detail="Не настроен HTTPS URL подписки 3x-ui")
+    try:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
+            upstream_response = await client.get(upstream_url, headers={
+                "User-Agent": request.headers.get("user-agent", "Happ"),
+                "Accept": request.headers.get("accept", "*/*"),
+            })
+    except httpx.HTTPError as exc:
+        logger.warning("Happ subscription upstream request failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Не удалось получить подписку с 3x-ui") from exc
+    if len(upstream_response.content) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=502, detail="Ответ подписки превышает допустимый размер")
+    forwarded = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+    for name in ("content-type", "content-disposition", "subscription-userinfo", "profile-title",
+                 "profile-update-interval", "announce", "support-url", "profile-web-page-url"):
+        if name in upstream_response.headers:
+            forwarded[name] = upstream_response.headers[name]
+    if routing_rules and upstream_response.is_success:
+        forwarded["routing"] = unquote(routing_deep_link(routing_rules))
+    return Response(content=upstream_response.content, status_code=upstream_response.status_code,
+                    headers=forwarded)
 
 
 @app.get("/offer", response_class=HTMLResponse)
