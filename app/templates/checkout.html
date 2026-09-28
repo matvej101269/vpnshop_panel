@@ -1,34 +1,45 @@
 <!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Оплата заказа</title>
-<style>
-*{box-sizing:border-box}body{margin:0;background:#f4f6fa;color:#15243a;font:16px/1.5 system-ui,sans-serif;min-height:100vh;display:grid;place-items:center;padding:24px}
-main{width:100%;max-width:460px;background:white;padding:32px;border-radius:24px;box-shadow:0 16px 60px #172c4810}
-.tag{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:#64748b}h1{font-size:26px;line-height:1.2;margin:12px 0;overflow-wrap:anywhere}.price{font-size:38px;font-weight:700;margin:24px 0}.muted{color:#64748b;font-size:14px}
-button,.button{display:block;width:100%;border:0;border-radius:12px;padding:16px;margin:12px 0;background:#215bec;color:white;font:600 16px system-ui;text-align:center;cursor:pointer;text-decoration:none}.card{background:#eaf0ff;color:#173e9e}button:disabled{opacity:.6;cursor:wait}.error{background:#fff0eb;padding:12px;border-radius:10px;color:#9a3412}a{color:#215bec}
+<title>Оплата заказа</title><style>
+*{box-sizing:border-box}body{margin:0;background:#f4f6fa;color:#15243a;font:16px/1.5 system-ui,sans-serif;min-height:100vh;display:grid;place-items:center;padding:24px}main{width:100%;max-width:510px;background:white;padding:32px;border-radius:24px;box-shadow:0 16px 60px #172c4810}.tag{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:#64748b}h1{font-size:26px;line-height:1.2;margin:12px 0;overflow-wrap:anywhere}.price{font-size:36px;font-weight:700;margin:20px 0 8px}.muted{color:#64748b;font-size:14px}button,.button{display:block;width:100%;border:0;border-radius:12px;padding:14px;margin:10px 0;background:#215bec;color:white;font:600 16px system-ui;text-align:center;cursor:pointer;text-decoration:none}.secondary{background:#eaf0ff;color:#173e9e}.error{background:#fff0eb;padding:12px;border-radius:10px;color:#9a3412}a{color:#215bec}.currencies{display:flex;gap:8px;margin:20px 0}.currencies a{flex:1;text-align:center;padding:10px;text-decoration:none;background:#f1f5f9;border-radius:10px}.currencies a[aria-current=true]{background:#215bec;color:white}details{border:1px solid #dce3ee;border-radius:12px;padding:12px;margin:10px 0}summary{cursor:pointer;font-weight:600}input{width:100%;padding:12px;border:1px solid #b8c5d8;border-radius:8px;font:inherit;margin:6px 0 12px}label{display:block;font-size:14px}.notice{padding:12px;background:#f1f5f9;border-radius:10px}@media(max-width:420px){body{padding:12px}main{padding:22px}}
 </style></head><body><main>
 <div class="tag">Оплата заказа</div><h1>{{ checkout.title }}</h1>
-<div class="price">{{ checkout.amount }} ₽</div>
 {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
-{% if state == 'open' %}
-<p>Выберите удобный способ оплаты</p>
-<form method="post"><input type="hidden" name="csrf" value="{{ checkout.csrf }}">
-<button name="method" value="SBP">Оплатить через СБП</button>
-<button class="card" name="method" value="CARD">Картой российского банка</button></form>
-<p class="muted">Платёж проходит через Lava.top. После оплаты бот пришлёт подтверждение в Telegram.</p>
-<p class="muted">Нажимая кнопку, вы принимаете <a href="/offer" target="_blank" rel="noopener">условия оферты</a>.</p>
+{% if choose %}
+<nav class="currencies" aria-label="Валюта оплаты">{% for code in currencies %}<a href="?change=1&amp;currency={{code}}" aria-current="{{ 'true' if code == currency else 'false' }}">{{code}}</a>{% endfor %}</nav>
+{% if quote %}
+<div class="price">{{ '%.2f'|format(quote.amount) }} {{ quote.currency }}</div>
+{% if quote.rate_date %}<p class="muted">Исходная цена: {{checkout.amount}} {{checkout.currency}}. Пересчёт по курсу ЦБ от {{quote.rate_date}}, без наценки. Цена для создания счёта фиксируется на 15 минут. Банк может применить свою конвертацию и комиссию.</p>{% endif %}
+<p>Выберите способ оплаты</p>
+{% for method, info in methods.items() %}
+{% if method in ['BIZUM','BANCONTACT'] %}<details><summary>{{info[0]}}</summary>{% endif %}
+<form class="payment-form" method="post" action="?change=1&amp;currency={{currency}}" target="_blank" rel="noopener">
+<input type="hidden" name="csrf" value="{{checkout.csrf}}"><input type="hidden" name="quote" value="{{quote.token}}"><input type="hidden" name="method" value="{{method}}">
+{% if method in ['BIZUM','BANCONTACT'] %}<label>Имя плательщика<input name="full_name" required maxlength="256" autocomplete="name"></label>{% endif %}
+{% if method == 'BIZUM' %}<label>Телефон Bizum<input name="wallet_id" type="tel" required pattern="\+?[1-9][0-9]{7,14}" placeholder="+34600111222" autocomplete="tel"></label>{% endif %}
+<button>{{ 'Оплатить' if method in ['BIZUM','BANCONTACT'] else info[0] }}</button></form>
+{% if method in ['BIZUM','BANCONTACT'] %}</details>{% endif %}
+{% endfor %}
+<p class="muted">Оплата откроется в новой вкладке. Здесь можно сменить способ. Доступность метода зависит от страны, устройства и условий Lava.top.</p>
+<p class="muted">Нажимая кнопку, вы принимаете <a href="/offer" target="_blank" rel="noopener">условия оферты</a>. Данные плательщика передаются Lava.top для выбранного способа.</p>
+{% endif %}
+{% if checkout.payment_url %}<p class="notice">Не оплачивайте несколько счетов одного заказа. Если деньги уже списаны, дождитесь подтверждения в боте.</p>{% endif %}
 {% elif state == 'ready' %}
-<p>Выбран способ: {{ 'СБП' if checkout.method == 'SBP' else 'карта РФ' }}.</p>
-<a class="button" href="{{ checkout.payment_url }}">Продолжить оплату</a>
-<p class="muted">Для этого заказа уже создан счёт. Повторное открытие продолжит ту же оплату.</p>
+<div class="price">{% if active %}{{'%.2f'|format(active.amount)}} {{active.currency}}{% else %}{{checkout.amount}} {{checkout.currency}}{% endif %}</div>
+<p>Счёт создан. Оплатите его в открывшейся вкладке.</p>
+<a class="button" target="_blank" rel="noopener" href="{{checkout.payment_url}}">Продолжить оплату</a>
+<a class="button secondary" href="?change=1">Сменить способ оплаты</a>
+<p class="muted">Вы можете выбрать другую валюту и способ. Если деньги уже списаны, не оплачивайте повторно.</p>
 {% elif state == 'paid' %}
 <h2>Оплата получена</h2><p>Вернитесь в Telegram. Бот пришлёт подтверждение после подключения услуги.</p>
+{% if extra_paid %}<p class="error">По заказу получена дополнительная оплата. Обратитесь в поддержку для проверки возврата.</p>{% endif %}
 {% elif state == 'creating' %}
-<p role="status">Подготавливаем оплату…</p><p class="muted">Страница обновится автоматически. Если ожидание затянулось, обратитесь в поддержку — повторно оплачивать не нужно.</p>
-<script>setTimeout(()=>location.reload(),3000)</script>
+<p role="status">Подготавливаем оплату…</p><p class="muted">Если ожидание затянулось, обратитесь в поддержку — повторно оплачивать не нужно.</p>
 {% elif state == 'expired' %}
 <p>Срок заказа истёк. Вернитесь в бот и выберите тариф заново.</p>
-{% else %}
-<p class="error">Не удалось получить ссылку на оплату. Обратитесь в поддержку и передайте ссылку на эту страницу.</p>
 {% endif %}
-</main></body></html>
+</main><script>
+document.querySelectorAll('.payment-form').forEach(form=>form.addEventListener('submit',()=>setTimeout(()=>location.href=location.pathname,600)));
+{% if state in ['creating','ready'] and not choose %}setTimeout(()=>location.reload(),{{3000 if state == 'creating' else 10000}});{% endif %}
+window.addEventListener('pageshow',event=>{if(event.persisted)location.reload()});
+</script></body></html>

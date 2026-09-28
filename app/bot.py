@@ -535,11 +535,8 @@ async def create_plan_order(callback: CallbackQuery, immediate_switch: bool):
                     await callback.message.answer("Ссылка для Happ:\n" + result[1])
             await callback.answer()
             return
-        if plan.currency != "RUB":
-            invoice_id, pay_url = await LavaClient().create_invoice(callback.from_user.id, plan, charge)
         with SessionLocal() as db:
-            if plan.currency == "RUB":
-                invoice_id, pay_url = new_checkout(db, plan.name, charge, plan.currency)
+            invoice_id, pay_url = new_checkout(db, plan.name, charge, plan.currency)
             db.add(PendingPayment(invoice_id=invoice_id, telegram_id=callback.from_user.id,
                                   plan_id=plan_id, product_type="plan", charged_amount=charge,
                                   credit_amount=credit, immediate_switch=switch_now,
@@ -567,10 +564,7 @@ async def buy_addon(callback: CallbackQuery):
             if not package or not package.enabled or not sub or not sub.enabled or not expires or expires <= datetime.now(timezone.utc) or not sub.traffic_limit_bytes:
                 await callback.answer("Пакет сейчас недоступен.", show_alert=True)
                 return
-            if package.currency == "RUB":
-                invoice_id, pay_url = new_checkout(db, package.name, package.amount, package.currency)
-            else:
-                invoice_id, pay_url = await LavaClient().create_invoice(callback.from_user.id, package)
+            invoice_id, pay_url = new_checkout(db, package.name, package.amount, package.currency)
             db.add(PendingPayment(invoice_id=invoice_id, telegram_id=callback.from_user.id,
                                   plan_id=0, package_id=package.id, product_type="addon",
                                   charged_amount=package.amount,

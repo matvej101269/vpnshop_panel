@@ -32,8 +32,8 @@ from app.runtime_config import (init_runtime_config, get_config, save_config, co
                                 make_csrf_token, verify_csrf_token, get_config_map,
                                 create_admin_session, verify_admin_session)
 from app.runtime_config import decrypt_handoff
-from app.checkout import router as checkout_router, matches_payment
-from app.db import Checkout
+from app.checkout import router as checkout_router, matches_payment, legacy_attempt
+from app.db import Checkout, PaymentAttempt
 
 templates = Jinja2Templates(directory="app/templates")
 logger = logging.getLogger(__name__)
@@ -511,6 +511,29 @@ async def lava_webhook(request: Request):
         if not invoice_id:
             raise HTTPException(status_code=400, detail="Missing invoice reference")
         with SessionLocal() as db:
+            attempt = db.scalar(select(PaymentAttempt).where(PaymentAttempt.invoice_id == invoice_id))
+            checkout = (db.get(Checkout, attempt.checkout_token, with_for_update=True) if attempt else
+                        db.scalar(select(Checkout).where(Checkout.invoice_id == invoice_id).with_for_update()))
+            if checkout:
+                if attempt:
+                    db.refresh(attempt)
+                if not attempt:
+                    if invoice_id.startswith("checkout-"):
+                        raise HTTPException(status_code=400, detail="Not a provider invoice")
+                    legacy_attempt(db, checkout)
+                    attempt = db.scalar(select(PaymentAttempt).where(PaymentAttempt.invoice_id == invoice_id))
+                if not matches_payment(attempt or checkout, payload):
+                    raise HTTPException(status_code=400, detail="Payment amount or currency does not match order")
+                if attempt and attempt.state in {"paid", "extra_paid"}:
+                    return {"ok": True, "duplicate": True}
+                if checkout.state == "paid":
+                    if attempt:
+                        attempt.state = "extra_paid"
+                        db.commit()
+                        logger.error("Additional checkout payment requires manual refund review")
+                    return {"ok": True, "additional_payment": True}
+                # Canonical order ID remains stable when the customer changes methods.
+                invoice_id = checkout.invoice_id
             payment = db.get(PendingPayment, invoice_id, with_for_update=True)
             if not payment:
                 if db.get(FulfillmentJob, invoice_id) or db.get(ProcessedPayment, hashlib.sha256(invoice_id.encode()).hexdigest()):
@@ -519,11 +542,10 @@ async def lava_webhook(request: Request):
             existing = db.get(FulfillmentJob, invoice_id)
             if existing:
                 return {"ok": True, "duplicate": True}
-            checkout = db.scalar(select(Checkout).where(Checkout.invoice_id == invoice_id))
             if checkout:
-                if checkout.state not in {"ready", "paid"} or not matches_payment(checkout, payload):
-                    raise HTTPException(status_code=400, detail="Payment amount or currency does not match order")
                 checkout.state = "paid"
+                if attempt:
+                    attempt.state = "paid"
             db.add(FulfillmentJob(invoice_id=invoice_id, status="queued", telegram_id=payment.telegram_id,
                                   product_type=payment.product_type))
             db.commit()
@@ -692,7 +714,9 @@ async def admin_page(section: str, request: Request, page: int = Query(1, ge=1),
             ctx.update(control_enabled=bool(env_settings.control_api_token), operation=request.query_params.get("operation", ""),
                        backup_files=[{"name": p.name, "size": p.stat().st_size} for p in backups[:14]],
                        backup_key_configured=bool(env_settings.backup_encryption_key), sync_issues=sync_issues,
-                       payment_issues=payment_issues)
+                       payment_issues=payment_issues,
+                       additional_payments=db.scalars(select(PaymentAttempt).where(
+                           PaymentAttempt.state == "extra_paid").order_by(PaymentAttempt.created_at.desc()).limit(100)).all())
         return templates.TemplateResponse(request, "admin_base.html", ctx | {"section_body": f"admin_{section}.html"})
 
 

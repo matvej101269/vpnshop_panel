@@ -1,6 +1,6 @@
 from pathlib import Path
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, BigInteger, DateTime, Boolean, Float, Text, Index, create_engine, inspect, text
+from sqlalchemy import String, Integer, BigInteger, Numeric, DateTime, Boolean, Float, Text, Index, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from app.config import settings
 
@@ -149,6 +149,30 @@ class Checkout(Base):
     currency: Mapped[str] = mapped_column(String(8))
     state: Mapped[str] = mapped_column(String(16), default="open")
     method: Mapped[str] = mapped_column(String(16), default="")
+    payment_url: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class CheckoutQuote(Base):
+    __tablename__ = "checkout_quotes"
+    token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    checkout_token: Mapped[str] = mapped_column(String(64), index=True)
+    amount: Mapped[object] = mapped_column(Numeric(18, 2))
+    currency: Mapped[str] = mapped_column(String(8))
+    rate: Mapped[object] = mapped_column(Numeric(24, 12))
+    rate_date: Mapped[str] = mapped_column(String(10), default="")
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class PaymentAttempt(Base):
+    __tablename__ = "payment_attempts"
+    token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    checkout_token: Mapped[str] = mapped_column(String(64), index=True)
+    invoice_id: Mapped[str | None] = mapped_column(String(100), unique=True, nullable=True)
+    amount: Mapped[object] = mapped_column(Numeric(18, 2))
+    currency: Mapped[str] = mapped_column(String(8))
+    method: Mapped[str] = mapped_column(String(24))
+    state: Mapped[str] = mapped_column(String(24), default="creating")
     payment_url: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 

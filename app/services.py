@@ -10,11 +10,13 @@ from app.db import (SessionLocal, Plan, AddonPackage, AddonBalance, PendingPayme
                     SubscriptionHistory, ProcessedPayment, PromoRedemption, ReferralAttribution,
                     ReferralReward, PromoSelection)
 from app.runtime_config import get_config, get_config_map
+from app.payment_options import METHODS
 
 
 class LavaClient:
     async def create_invoice(self, telegram_id: int, plan: Plan, amount: int | None = None,
-                             *, payment_method: str | None = None) -> tuple[str, str]:
+                             *, payment_method: str | None = None, return_url: str = "",
+                             full_name: str = "", wallet_id: str = "") -> tuple[str, str]:
         cfg = get_config_map()
         if not cfg["lava_api_key"] or not cfg["lava_offer_id"]:
             raise RuntimeError("Не настроены LAVA_API_KEY и LAVA_OFFER_ID")
@@ -25,11 +27,21 @@ class LavaClient:
         if cfg["lava_payment_provider"]:
             payload["paymentProvider"] = cfg["lava_payment_provider"]
         if payment_method is not None:
-            if plan.currency != "RUB" or payment_method not in {"CARD", "SBP"}:
+            if payment_method not in METHODS.get(plan.currency, {}):
                 raise ValueError("Unsupported checkout payment method")
-            payload["paymentProvider"] = "PAY2ME" if payment_method == "SBP" else "SMART_GLOCAL"
-            payload["paymentMethod"] = payment_method
+            payload["paymentProvider"] = METHODS[plan.currency][payment_method][1]
+            if payment_method != "PAYPAL":
+                payload["paymentMethod"] = "CARD" if payment_method == "CARD_PAY2ME" else payment_method
             payload["periodicity"] = "ONE_TIME"
+            payload["amount"] = float(payload["amount"])
+            if full_name:
+                payload["fullName"] = full_name
+            if wallet_id:
+                payload["walletId"] = wallet_id
+        if return_url:
+            payload.update(successful_return_url=return_url,
+                           failure_return_url=return_url + "?change=1",
+                           cancel_return_url=return_url + "?change=1")
         async with httpx.AsyncClient(timeout=20) as client:
             invoice_url = cfg["lava_api_url"].rstrip("/") + "/" + cfg["lava_invoice_path"].lstrip("/")
             response = await client.post(invoice_url, json=payload,
