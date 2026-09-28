@@ -24,6 +24,16 @@ METHODS = {
 _cached = None
 
 
+def amount_limit_error(amount, currency):
+    # https://faq.lava.top/article/83555 — custom-price product limits.
+    minimum, maximum = (Decimal(50), Decimal(1000000)) if currency == "RUB" else (Decimal(5), Decimal(10000))
+    if Decimal(amount) < minimum:
+        return f"Минимальная сумма оплаты через Lava.top — {minimum} {currency}. Выберите другую валюту или тариф с большей стоимостью."
+    if Decimal(amount) > maximum:
+        return f"Максимальная сумма оплаты через Lava.top — {maximum} {currency}. Выберите другой тариф."
+    return ""
+
+
 def parse_rates(content):
     root = ET.fromstring(content)
     day = datetime.strptime(root.attrib["Date"], "%d.%m.%Y").date()

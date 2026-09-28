@@ -16,7 +16,7 @@ from sqlalchemy import select, update
 from app.db import Checkout, CheckoutQuote, PaymentAttempt, PendingPayment, SessionLocal
 from app.runtime_config import get_config
 from app.services import LavaClient
-from app.payment_options import METHODS, exchange_rates, convert_amount
+from app.payment_options import METHODS, exchange_rates, convert_amount, amount_limit_error
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -122,6 +122,7 @@ async def render_page(token, request, *, error="", status=200):
             "checkout": row, "state": state, "choose": choose, "error": error,
             "currency": currency, "currencies": list(METHODS), "methods": METHODS[currency],
             "quote": quote, "active": active, "extra_paid": extra_paid,
+            "limit_error": amount_limit_error(quote.amount, quote.currency) if quote else "",
         }, status_code=status, headers=HEADERS)
 
 
@@ -147,6 +148,9 @@ async def choose_method(token: str, request: Request):
             return await render_page(token, request, error="Цена устарела. Проверьте обновлённую сумму и выберите способ ещё раз.", status=409)
         if method not in METHODS.get(quote.currency, {}):
             raise HTTPException(400, "Способ недоступен для выбранной валюты")
+        limit_error = amount_limit_error(quote.amount, quote.currency)
+        if limit_error:
+            return await render_page(token, request, error=limit_error, status=400)
         full_name = str(form.get("full_name", "")).strip() if method in {"BANCONTACT", "BIZUM"} else ""
         wallet_id = str(form.get("wallet_id", "")).strip() if method == "BIZUM" else ""
         if method in {"BANCONTACT", "BIZUM"} and not 1 <= len(full_name) <= 256:

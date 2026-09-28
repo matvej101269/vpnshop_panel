@@ -10,6 +10,7 @@
 {% if quote %}
 <div class="price">{{ '%.2f'|format(quote.amount) }} {{ quote.currency }}</div>
 {% if quote.rate_date %}<p class="muted">Исходная цена: {{checkout.amount}} {{checkout.currency}}. Пересчёт по курсу ЦБ от {{quote.rate_date}}, без наценки. Цена для создания счёта фиксируется на 15 минут. Банк может применить свою конвертацию и комиссию.</p>{% endif %}
+{% if limit_error %}<p class="notice" role="status">{{limit_error}}</p>{% else %}
 <p>Выберите способ оплаты</p>
 {% for method, info in methods.items() %}
 {% if method in ['BIZUM','BANCONTACT'] %}<details><summary>{{info[0]}}</summary>{% endif %}
@@ -20,6 +21,7 @@
 <button>{{ 'Оплатить' if method in ['BIZUM','BANCONTACT'] else info[0] }}</button></form>
 {% if method in ['BIZUM','BANCONTACT'] %}</details>{% endif %}
 {% endfor %}
+{% endif %}
 <p class="muted">Оплата откроется в новой вкладке. Здесь можно сменить способ. Доступность метода зависит от страны, устройства и условий Lava.top.</p>
 <p class="muted">Нажимая кнопку, вы принимаете <a href="/offer" target="_blank" rel="noopener">условия оферты</a>. Данные плательщика передаются Lava.top для выбранного способа.</p>
 {% endif %}
