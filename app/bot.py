@@ -25,6 +25,7 @@ from app.db import (SessionLocal, Plan, AddonPackage, PendingPayment, BotMenuNod
                     PromoSelection, PromoRedemption, ReferralAttribution, ReferralReward)
 from app.services import LavaClient, XUIClient, happ_link, quote_immediate_switch, provision_paid_invoice
 from app.runtime_config import get_config, get_config_map, encrypt_handoff
+from app.checkout import new_checkout
 
 logger = logging.getLogger(__name__)
 BOT_USERNAME = ""
@@ -534,8 +535,11 @@ async def create_plan_order(callback: CallbackQuery, immediate_switch: bool):
                     await callback.message.answer("Ссылка для Happ:\n" + result[1])
             await callback.answer()
             return
-        invoice_id, pay_url = await LavaClient().create_invoice(callback.from_user.id, plan, charge)
+        if plan.currency != "RUB":
+            invoice_id, pay_url = await LavaClient().create_invoice(callback.from_user.id, plan, charge)
         with SessionLocal() as db:
+            if plan.currency == "RUB":
+                invoice_id, pay_url = new_checkout(db, plan.name, charge, plan.currency)
             db.add(PendingPayment(invoice_id=invoice_id, telegram_id=callback.from_user.id,
                                   plan_id=plan_id, product_type="plan", charged_amount=charge,
                                   credit_amount=credit, immediate_switch=switch_now,
@@ -563,9 +567,13 @@ async def buy_addon(callback: CallbackQuery):
             if not package or not package.enabled or not sub or not sub.enabled or not expires or expires <= datetime.now(timezone.utc) or not sub.traffic_limit_bytes:
                 await callback.answer("Пакет сейчас недоступен.", show_alert=True)
                 return
-            invoice_id, pay_url = await LavaClient().create_invoice(callback.from_user.id, package)
+            if package.currency == "RUB":
+                invoice_id, pay_url = new_checkout(db, package.name, package.amount, package.currency)
+            else:
+                invoice_id, pay_url = await LavaClient().create_invoice(callback.from_user.id, package)
             db.add(PendingPayment(invoice_id=invoice_id, telegram_id=callback.from_user.id,
                                   plan_id=0, package_id=package.id, product_type="addon",
+                                  charged_amount=package.amount,
                                   package_traffic_bytes=int(package.traffic_gb * (1024 ** 3))))
             db.commit()
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Оплатить", url=pay_url)]])

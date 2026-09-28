@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Оплата заказа</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f6fa;color:#15243a;font:16px/1.5 system-ui,sans-serif;min-height:100vh;display:grid;place-items:center;padding:24px}
+main{width:100%;max-width:460px;background:white;padding:32px;border-radius:24px;box-shadow:0 16px 60px #172c4810}
+.tag{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:#64748b}h1{font-size:26px;line-height:1.2;margin:12px 0;overflow-wrap:anywhere}.price{font-size:38px;font-weight:700;margin:24px 0}.muted{color:#64748b;font-size:14px}
+button,.button{display:block;width:100%;border:0;border-radius:12px;padding:16px;margin:12px 0;background:#215bec;color:white;font:600 16px system-ui;text-align:center;cursor:pointer;text-decoration:none}.card{background:#eaf0ff;color:#173e9e}button:disabled{opacity:.6;cursor:wait}.error{background:#fff0eb;padding:12px;border-radius:10px;color:#9a3412}a{color:#215bec}
+</style></head><body><main>
+<div class="tag">Оплата заказа</div><h1>{{ checkout.title }}</h1>
+<div class="price">{{ checkout.amount }} ₽</div>
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+{% if state == 'open' %}
+<p>Выберите удобный способ оплаты</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ checkout.csrf }}">
+<button name="method" value="SBP">Оплатить через СБП</button>
+<button class="card" name="method" value="CARD">Картой российского банка</button></form>
+<p class="muted">Платёж проходит через Lava.top. После оплаты бот пришлёт подтверждение в Telegram.</p>
+<p class="muted">Нажимая кнопку, вы принимаете <a href="/offer" target="_blank" rel="noopener">условия оферты</a>.</p>
+{% elif state == 'ready' %}
+<p>Выбран способ: {{ 'СБП' if checkout.method == 'SBP' else 'карта РФ' }}.</p>
+<a class="button" href="{{ checkout.payment_url }}">Продолжить оплату</a>
+<p class="muted">Для этого заказа уже создан счёт. Повторное открытие продолжит ту же оплату.</p>
+{% elif state == 'paid' %}
+<h2>Оплата получена</h2><p>Вернитесь в Telegram. Бот пришлёт подтверждение после подключения услуги.</p>
+{% elif state == 'creating' %}
+<p role="status">Подготавливаем оплату…</p><p class="muted">Страница обновится автоматически. Если ожидание затянулось, обратитесь в поддержку — повторно оплачивать не нужно.</p>
+<script>setTimeout(()=>location.reload(),3000)</script>
+{% elif state == 'expired' %}
+<p>Срок заказа истёк. Вернитесь в бот и выберите тариф заново.</p>
+{% else %}
+<p class="error">Не удалось получить ссылку на оплату. Обратитесь в поддержку и передайте ссылку на эту страницу.</p>
+{% endif %}
+</main></body></html>

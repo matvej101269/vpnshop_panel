@@ -32,6 +32,8 @@ from app.runtime_config import (init_runtime_config, get_config, save_config, co
                                 make_csrf_token, verify_csrf_token, get_config_map,
                                 create_admin_session, verify_admin_session)
 from app.runtime_config import decrypt_handoff
+from app.checkout import router as checkout_router, matches_payment
+from app.db import Checkout
 
 templates = Jinja2Templates(directory="app/templates")
 logger = logging.getLogger(__name__)
@@ -286,6 +288,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="VPN Shop", lifespan=lifespan)
+app.include_router(checkout_router)
 
 
 @app.middleware("http")
@@ -508,7 +511,7 @@ async def lava_webhook(request: Request):
         if not invoice_id:
             raise HTTPException(status_code=400, detail="Missing invoice reference")
         with SessionLocal() as db:
-            payment = db.get(PendingPayment, invoice_id)
+            payment = db.get(PendingPayment, invoice_id, with_for_update=True)
             if not payment:
                 if db.get(FulfillmentJob, invoice_id) or db.get(ProcessedPayment, hashlib.sha256(invoice_id.encode()).hexdigest()):
                     return {"ok": True, "duplicate": True}
@@ -516,6 +519,11 @@ async def lava_webhook(request: Request):
             existing = db.get(FulfillmentJob, invoice_id)
             if existing:
                 return {"ok": True, "duplicate": True}
+            checkout = db.scalar(select(Checkout).where(Checkout.invoice_id == invoice_id))
+            if checkout:
+                if checkout.state not in {"ready", "paid"} or not matches_payment(checkout, payload):
+                    raise HTTPException(status_code=400, detail="Payment amount or currency does not match order")
+                checkout.state = "paid"
             db.add(FulfillmentJob(invoice_id=invoice_id, status="queued", telegram_id=payment.telegram_id,
                                   product_type=payment.product_type))
             db.commit()

@@ -139,6 +139,20 @@ class PendingPayment(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class Checkout(Base):
+    __tablename__ = "checkouts"
+    token: Mapped[str] = mapped_column(String(64), primary_key=True)
+    csrf: Mapped[str] = mapped_column(String(64))
+    invoice_id: Mapped[str] = mapped_column(String(100), unique=True)
+    title: Mapped[str] = mapped_column(String(200))
+    amount: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(8))
+    state: Mapped[str] = mapped_column(String(16), default="open")
+    method: Mapped[str] = mapped_column(String(16), default="")
+    payment_url: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class Subscription(Base):
     __tablename__ = "subscriptions"
     __table_args__ = (Index("ix_subscriptions_enabled_expires", "enabled", "expires_at"),)

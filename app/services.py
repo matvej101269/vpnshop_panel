@@ -13,7 +13,8 @@ from app.runtime_config import get_config, get_config_map
 
 
 class LavaClient:
-    async def create_invoice(self, telegram_id: int, plan: Plan, amount: int | None = None) -> tuple[str, str]:
+    async def create_invoice(self, telegram_id: int, plan: Plan, amount: int | None = None,
+                             *, payment_method: str | None = None) -> tuple[str, str]:
         cfg = get_config_map()
         if not cfg["lava_api_key"] or not cfg["lava_offer_id"]:
             raise RuntimeError("Не настроены LAVA_API_KEY и LAVA_OFFER_ID")
@@ -23,6 +24,12 @@ class LavaClient:
                    "email": f"{uuid.uuid4().hex}@example.com"}
         if cfg["lava_payment_provider"]:
             payload["paymentProvider"] = cfg["lava_payment_provider"]
+        if payment_method is not None:
+            if plan.currency != "RUB" or payment_method not in {"CARD", "SBP"}:
+                raise ValueError("Unsupported checkout payment method")
+            payload["paymentProvider"] = "PAY2ME" if payment_method == "SBP" else "SMART_GLOCAL"
+            payload["paymentMethod"] = payment_method
+            payload["periodicity"] = "ONE_TIME"
         async with httpx.AsyncClient(timeout=20) as client:
             invoice_url = cfg["lava_api_url"].rstrip("/") + "/" + cfg["lava_invoice_path"].lstrip("/")
             response = await client.post(invoice_url, json=payload,
