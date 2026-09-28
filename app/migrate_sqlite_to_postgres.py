@@ -8,7 +8,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, inspect, text
 
-from app.db import Base, engine as configured_engine, init_db
+from app.db import Base, engine as configured_engine, init_db, upgrade_postgres_schema
 
 
 def migrate(source_path: Path, target_url: str, clear_target: bool) -> None:
@@ -24,6 +24,7 @@ def migrate(source_path: Path, target_url: str, clear_target: bool) -> None:
     if target.dialect.name != "postgresql":
         raise SystemExit("TARGET_DATABASE_URL must point to PostgreSQL")
     Base.metadata.create_all(target)
+    upgrade_postgres_schema(target)
     source_tables = set(inspect(source).get_table_names())
     tables = [table for table in Base.metadata.sorted_tables if table.name in source_tables]
 

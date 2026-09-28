@@ -1,6 +1,6 @@
 from pathlib import Path
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, DateTime, Boolean, Float, Text, Index, create_engine, inspect, text
+from sqlalchemy import String, Integer, BigInteger, DateTime, Boolean, Float, Text, Index, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from app.config import settings
 
@@ -29,7 +29,7 @@ class BotMenuNode(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     parent_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     label: Mapped[str] = mapped_column(String(64))
-    action: Mapped[str] = mapped_column(String(16), default="menu")
+    action: Mapped[str] = mapped_column(String(64), default="menu")
     text: Mapped[str] = mapped_column(Text, default="")
     url: Mapped[str] = mapped_column(String(500), default="")
     routing_rules: Mapped[str] = mapped_column(Text, default="")
@@ -50,29 +50,29 @@ class PromoCode(Base):
 
 class PromoSelection(Base):
     __tablename__ = "promo_selections"
-    telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
     promo_id: Mapped[int] = mapped_column(Integer, index=True)
     selected_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class PromoPrompt(Base):
     __tablename__ = "promo_prompts"
-    telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
 
 
 class PromoRedemption(Base):
     __tablename__ = "promo_redemptions"
     promo_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
     invoice_hash: Mapped[str] = mapped_column(String(64), unique=True)
     redeemed_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class ReferralAttribution(Base):
     __tablename__ = "referral_attributions"
-    referred_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    referrer_id: Mapped[int] = mapped_column(Integer, index=True)
+    referred_id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    referrer_id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -95,18 +95,18 @@ class AddonPackage(Base):
 class AddonBalance(Base):
     """Remaining one-time add-on traffic, tracked independently from plan quota."""
     __tablename__ = "addon_balances"
-    telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    base_limit_bytes: Mapped[int] = mapped_column(Integer, default=0)
-    remaining_bytes: Mapped[int] = mapped_column(Integer, default=0)
-    consumed_cycle_bytes: Mapped[int] = mapped_column(Integer, default=0)
-    last_usage_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    telegram_id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    base_limit_bytes: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), default=0)
+    remaining_bytes: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), default=0)
+    consumed_cycle_bytes: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), default=0)
+    last_usage_bytes: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), default=0)
     reset_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class TrialClaim(Base):
     """Permanent trial-block marker; stores only the Telegram ID and claim time."""
     __tablename__ = "trial_claims"
-    telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
     claimed_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
@@ -117,11 +117,11 @@ class PendingPayment(Base):
                             postgresql_where=text("immediate_switch = true"),
                             sqlite_where=text("immediate_switch = 1")),)
     invoice_id: Mapped[str] = mapped_column(String(100), primary_key=True)
-    telegram_id: Mapped[int] = mapped_column(Integer, index=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), index=True)
     plan_id: Mapped[int] = mapped_column(Integer, default=0)
     product_type: Mapped[str] = mapped_column(String(16), default="plan")
     package_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    package_traffic_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    package_traffic_bytes: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), default=0)
     charged_amount: Mapped[int] = mapped_column(Integer, default=0)
     credit_amount: Mapped[int] = mapped_column(Integer, default=0)
     immediate_switch: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -142,14 +142,14 @@ class PendingPayment(Base):
 class Subscription(Base):
     __tablename__ = "subscriptions"
     __table_args__ = (Index("ix_subscriptions_enabled_expires", "enabled", "expires_at"),)
-    telegram_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
     plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     sub_id: Mapped[str] = mapped_column(String(100), unique=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     plan_name: Mapped[str] = mapped_column(String(100), default="")
     current_price: Mapped[int] = mapped_column(Integer, default=0)
     currency: Mapped[str] = mapped_column(String(8), default="RUB")
-    traffic_limit_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    traffic_limit_bytes: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), default=0)
     limit_hwid: Mapped[int] = mapped_column(Integer, default=0)
     traffic_reset: Mapped[str] = mapped_column(String(16), default="never")
     inbound_ids: Mapped[str] = mapped_column(Text, default="")
@@ -171,7 +171,7 @@ class FulfillmentJob(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[str] = mapped_column(String(500), default="")
     notification_pending: Mapped[bool] = mapped_column(Boolean, default=False)
-    telegram_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    telegram_id: Mapped[int | None] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), nullable=True)
     product_type: Mapped[str] = mapped_column(String(16), default="plan")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -182,12 +182,12 @@ class SubscriptionHistory(Base):
                       Index("ix_subscription_history_start", "starts_at"),
                       Index("ix_subscription_history_plan", "plan_name"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    telegram_id: Mapped[int] = mapped_column(Integer, index=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), index=True)
     plan_name: Mapped[str] = mapped_column(String(100))
     plan_days: Mapped[int] = mapped_column(Integer)
     price: Mapped[int] = mapped_column(Integer, default=0)
     currency: Mapped[str] = mapped_column(String(8), default="RUB")
-    traffic_limit_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    traffic_limit_bytes: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), default=0)
     starts_at: Mapped[datetime] = mapped_column(DateTime)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
 
@@ -228,6 +228,24 @@ engine = create_engine(settings.database_url, **engine_options)
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 
 
+def upgrade_postgres_schema(target_engine):
+    if target_engine.dialect.name != "postgresql":
+        return
+    with target_engine.begin() as conn:
+        quote = conn.dialect.identifier_preparer.quote
+        for table in Base.metadata.sorted_tables:
+            existing = {column["name"]: column["type"]
+                        for column in inspect(conn).get_columns(table.name)}
+            for column in table.columns:
+                if isinstance(column.type, BigInteger) and not isinstance(existing[column.name], BigInteger):
+                    conn.execute(text(f"ALTER TABLE {quote(table.name)} ALTER COLUMN {quote(column.name)} TYPE BIGINT"))
+    columns = inspect(target_engine).get_columns("bot_menu_nodes")
+    action_type = next(column["type"] for column in columns if column["name"] == "action")
+    if getattr(action_type, "length", None) is not None and action_type.length < 64:
+        with target_engine.begin() as conn:
+            conn.execute(text("ALTER TABLE bot_menu_nodes ALTER COLUMN action TYPE VARCHAR(64)"))
+
+
 def init_db():
     legacy_subscriptions = []
     migrated_legacy_schema = False
@@ -248,6 +266,7 @@ def init_db():
                 if "webhook_events" in table_names:
                     conn.execute(text("DROP TABLE webhook_events"))
     Base.metadata.create_all(engine)
+    upgrade_postgres_schema(engine)
     # Small in-place SQLite schema upgrade for databases created by earlier app revisions.
     if settings.database_url.startswith("sqlite"):
         upgrades = {
