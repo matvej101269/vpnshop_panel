@@ -19,7 +19,7 @@ from app import checkout
 from app.db import Base, Checkout, CheckoutQuote, PaymentAttempt, PendingPayment, FulfillmentJob
 from app.main import lava_webhook
 from app.services import LavaClient
-from app.payment_options import METHODS, convert_amount, parse_rates, amount_limit_error
+from app.payment_options import METHODS, amount_limit_error
 
 
 class CheckoutTests(unittest.TestCase):
@@ -32,8 +32,6 @@ class CheckoutTests(unittest.TestCase):
                         patch("app.checkout.amount_limit_error", return_value=""),
                         patch("app.main.SessionLocal", self.sessions),
                         patch("app.checkout.get_config", return_value="https://shop.example"),
-                        patch("app.checkout.exchange_rates", new_callable=AsyncMock,
-                              return_value=({"RUB": Decimal(1), "USD": Decimal(100), "EUR": Decimal(125)}, "2026-09-28")),
                         patch("app.main.get_config", return_value="webhook-secret")]
         for item in self.patches:
             item.start()
@@ -184,30 +182,29 @@ class CheckoutTests(unittest.TestCase):
         return self.client.post("/webhooks/lava", headers={"X-Api-Key": "webhook-secret"}, json={
             "eventType": "payment.success", "contractId": invoice_id, "amount": amount, "currency": currency})
 
-    def test_currency_filter_conversion_and_invalid_combination(self):
+    def test_currency_is_fixed_by_bot_order(self):
         page = self.client.get(self.url + "?currency=USD")
-        self.assertIn("0.50 USD", page.text)
-        self.assertNotIn('value="SBP"', page.text)
-        self.assertIn('value="APPLE_PAY"', page.text)
-        self.assertEqual(self.choose("SBP", "USD").status_code, 400)
-        with patch.object(LavaClient, "create_invoice", new_callable=AsyncMock,
-                          return_value=("usd-invoice", "https://pay.example/usd")) as mocked:
-            self.assertEqual(self.choose("PAYPAL", "USD").status_code, 303)
-            product = mocked.call_args.args[1]
-            self.assertEqual((product.amount, product.currency), (Decimal("0.50"), "USD"))
-        self.assertEqual(self.webhook("usd-invoice", 50).status_code, 400)
-        self.assertTrue(self.webhook("usd-invoice", "0.50", "USD").json()["queued"])
+        self.assertIn("50.00 RUB", page.text)
+        self.assertNotIn('value="APPLE_PAY"', page.text)
+        self.assertEqual(self.choose("PAYPAL", "USD").status_code, 400)
+        token = self.quote_token()
+        with self.sessions() as db:
+            quote = db.get(CheckoutQuote, token)
+            quote.currency, quote.amount = "USD", Decimal("5.00")
+            db.commit()
+        response = self.client.post(self.url, data={"csrf": self.row.csrf, "quote": token, "method": "CARD"})
+        self.assertEqual(response.status_code, 409)
 
     def test_switch_and_old_invoice_payment_only_fulfills_once(self):
         with patch.object(LavaClient, "create_invoice", new_callable=AsyncMock, side_effect=[
             ("old", "https://pay.example/old"), ("new", "https://pay.example/new")]) as mocked:
             self.choose()
             self.assertIn("Сменить способ оплаты", self.client.get(self.url).text)
-            self.choose("CARD", "USD")
+            self.choose("CARD")
             self.assertEqual(mocked.await_count, 2)
         self.assertTrue(self.webhook("old", 50).json()["queued"])
-        self.assertTrue(self.webhook("new", "0.50", "USD").json()["additional_payment"])
-        self.assertTrue(self.webhook("new", "0.50", "USD").json()["duplicate"])
+        self.assertTrue(self.webhook("new", 50).json()["additional_payment"])
+        self.assertTrue(self.webhook("new", 50).json()["duplicate"])
         with self.sessions() as db:
             self.assertEqual(db.scalar(select(func.count()).select_from(FulfillmentJob)), 1)
             self.assertEqual(db.scalar(select(PaymentAttempt).where(PaymentAttempt.invoice_id == "new")).state, "extra_paid")
@@ -269,25 +266,16 @@ class CheckoutTests(unittest.TestCase):
         response = self.client.post(self.url, data={"csrf": self.row.csrf, "quote": token, "method": "CARD"})
         self.assertEqual(response.status_code, 409)
 
-    def test_fx_outage_keeps_base_currency_available(self):
-        with patch("app.checkout.exchange_rates", new_callable=AsyncMock, side_effect=ValueError("offline")):
-            self.assertNotIn('class="payment-form"', self.client.get(self.url + "?currency=EUR").text)
-            self.assertIn('class="payment-form"', self.client.get(self.url).text)
-
-    def test_rate_nominal_and_rounding(self):
-        day = datetime.now(timezone.utc).strftime("%d.%m.%Y")
-        rates, _ = parse_rates(f'<ValCurs Date="{day}"><Valute><CharCode>USD</CharCode><Value>1000,00</Value><Nominal>10</Nominal></Valute><Valute><CharCode>EUR</CharCode><Value>125,00</Value><Nominal>1</Nominal></Valute></ValCurs>'.encode())
-        self.assertEqual(convert_amount(50, "RUB", "USD", rates)[0], Decimal("0.50"))
-        self.assertEqual(convert_amount(1, "USD", "EUR", rates)[0], Decimal("0.80"))
-        with self.assertRaises(ValueError):
-            parse_rates(b'<ValCurs Date="01.01.2000"/>')
-
     def test_provider_amount_limits_before_api_call(self):
         for currency, minimum, maximum in [("RUB", 50, 1000000), ("USD", 5, 10000), ("EUR", 5, 10000)]:
             self.assertTrue(amount_limit_error(Decimal(minimum) - Decimal("0.01"), currency))
             self.assertEqual(amount_limit_error(minimum, currency), "")
             self.assertEqual(amount_limit_error(maximum, currency), "")
             self.assertTrue(amount_limit_error(maximum + 1, currency))
+        with self.sessions() as db:
+            row = db.get(Checkout, self.row.token)
+            row.currency, row.amount = "USD", 1
+            db.commit()
         token = self.quote_token("USD")
         with patch("app.checkout.amount_limit_error", side_effect=amount_limit_error), patch.object(LavaClient, "create_invoice", new_callable=AsyncMock) as create:
             page = self.client.get(self.url + "?currency=USD")
@@ -296,7 +284,7 @@ class CheckoutTests(unittest.TestCase):
             result = self.client.post(self.url + "?currency=USD", data={"csrf": self.row.csrf, "quote": token, "method": "CARD"})
             self.assertEqual(result.status_code, 400)
             create.assert_not_called()
-            self.assertIn('class="payment-form"', self.client.get(self.url).text)
+            self.assertNotIn('class="payment-form"', self.client.get(self.url).text)
 
 
 if __name__ == "__main__":

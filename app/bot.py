@@ -23,9 +23,11 @@ from sqlalchemy.exc import IntegrityError
 from app.db import (SessionLocal, Plan, AddonPackage, PendingPayment, BotMenuNode,
                     Subscription, SubscriptionHistory, TrialClaim, PromoCode, PromoPrompt,
                     PromoSelection, PromoRedemption, ReferralAttribution, ReferralReward)
-from app.services import LavaClient, XUIClient, happ_link, quote_immediate_switch, provision_paid_invoice
+from app.services import XUIClient, happ_link, quote_immediate_switch, provision_paid_invoice
 from app.runtime_config import get_config, get_config_map, encrypt_handoff
 from app.checkout import new_checkout
+from app.db import PlanPeriod, UserCurrency
+from app.plan_catalog import CURRENCIES, selected_currency, visible_plans, periods_for, period_label, period_plan
 
 logger = logging.getLogger(__name__)
 BOT_USERNAME = ""
@@ -159,6 +161,80 @@ def menu_keyboard(db, parent_id: int | None, include_back: bool = True, telegram
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
+def currency_keyboard(action="buy", parent=0):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=c, callback_data=f"currency:{c}:{action}:{parent}") for c in CURRENCIES],
+        [InlineKeyboardButton(text="‹ Главное меню", callback_data="menu:0")]])
+
+
+def catalog_view(db, telegram_id, action="buy", parent=0):
+    currency = selected_currency(db, telegram_id)
+    if not currency:
+        return "Выберите валюту оплаты:", currency_keyboard(action, parent)
+    rows = []
+    for plan in visible_plans(db, currency):
+        periods = periods_for(db, plan.id)
+        if periods:
+            price = min(p.amount for p in periods)
+            rows.append([InlineKeyboardButton(text=f"{plan.name} · от {price} {currency}", callback_data=f"periods:{plan.id}:{action}")])
+    text = f"Выберите тариф · {currency}:" if rows else f"Пока нет доступных тарифов в {currency}. Выберите другую валюту."
+    rows.append([InlineKeyboardButton(text=f"Сменить валюту · {currency}", callback_data=f"currencies:{action}:{parent}")])
+    rows.append([InlineKeyboardButton(text="‹ Назад", callback_data=f"menu:{parent}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data.startswith("currencies:"))
+async def choose_currency_menu(callback: CallbackQuery):
+    _, action, parent = callback.data.split(":")
+    if action not in {"buy", "switch"} or not parent.isdigit():
+        await callback.answer("Меню недоступно")
+        return
+    await callback.message.answer("Выберите валюту оплаты:", reply_markup=currency_keyboard(action, int(parent)))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("currency:"))
+async def choose_currency(callback: CallbackQuery):
+    _, currency, action, parent = callback.data.split(":")
+    if currency not in CURRENCIES or action not in {"buy", "switch"} or not parent.isdigit():
+        await callback.answer("Валюта недоступна", show_alert=True)
+        return
+    with SessionLocal() as db:
+        row = db.get(UserCurrency, callback.from_user.id)
+        if row:
+            row.currency = currency
+        else:
+            db.add(UserCurrency(telegram_id=callback.from_user.id, currency=currency))
+        db.commit()
+        text, keyboard = catalog_view(db, callback.from_user.id, action, int(parent))
+    await callback.message.answer(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("periods:"))
+async def choose_period(callback: CallbackQuery):
+    _, plan_id, action = callback.data.split(":")
+    if action not in {"buy", "switch"} or not plan_id.isdigit():
+        await callback.answer("Тариф недоступен")
+        return
+    with SessionLocal() as db:
+        plan = db.get(Plan, int(plan_id))
+        if not plan or not plan.enabled or not plan.show_in_bot:
+            await callback.answer("Тариф недоступен", show_alert=True)
+            return
+        if selected_currency(db, callback.from_user.id) != plan.currency:
+            await callback.message.answer("Выберите валюту оплаты:", reply_markup=currency_keyboard(action))
+            await callback.answer()
+            return
+        rows = [[InlineKeyboardButton(text=f"{period_label(p)} · {p.days} дн. — {p.amount} {plan.currency}",
+                                      callback_data=f"{action}:{plan.id}:{p.id}")]
+                for p in periods_for(db, plan.id)]
+        rows.append([InlineKeyboardButton(text="‹ Тарифы и валюта", callback_data=f"currencies:{action}:0")])
+        text = f"{plan.name} · {plan.currency}\nВыберите период подписки:"
+    await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
 async def show_menu(target, parent_id: int | None):
     telegram_id = target.from_user.id
     with SessionLocal() as db:
@@ -172,13 +248,13 @@ async def show_menu(target, parent_id: int | None):
                 return
             text = node.text or node.label
             if node.action in {"plans", "change_plan"}:
-                plans = db.scalars(select(Plan).where(Plan.enabled.is_(True), Plan.show_in_bot.is_(True))).all()
                 action = "switch" if node.action == "change_plan" else "buy"
-                rows = [[InlineKeyboardButton(text=f"{p.name} — {p.amount} {p.currency}", callback_data=f"{action}:{p.id}")]
-                        for p in plans]
-                rows.append([InlineKeyboardButton(text="‹ Назад", callback_data=f"menu:{node.parent_id or 0}")])
-                keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
-                text = node.text or "Выберите период VPN-подписки:"
+                text, keyboard = catalog_view(db, telegram_id, action, node.parent_id or 0)
+                if node.text:
+                    text = node.text + "\n\n" + text
+            elif node.action == "currency":
+                text = node.text or "Выберите валюту оплаты:"
+                keyboard = currency_keyboard("buy", node.parent_id or 0)
             elif node.action == "subscription_info":
                 sub = db.get(Subscription, target.from_user.id)
                 if not sub:
@@ -199,9 +275,10 @@ async def show_menu(target, parent_id: int | None):
             elif node.action == "addons":
                 sub = db.get(Subscription, target.from_user.id)
                 expires = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
-                packages = db.scalars(select(AddonPackage).where(AddonPackage.enabled.is_(True))).all() if sub and sub.enabled and sub.traffic_limit_bytes and expires and expires > datetime.now(timezone.utc) else []
+                packages = db.scalars(select(AddonPackage).where(AddonPackage.enabled.is_(True), AddonPackage.currency == selected_currency(db, telegram_id))).all() if sub and sub.enabled and sub.traffic_limit_bytes and expires and expires > datetime.now(timezone.utc) else []
                 rows = [[InlineKeyboardButton(text=f"{pkg.name} · {pkg.traffic_gb:g} ГБ — {pkg.amount} {pkg.currency}",
                                               callback_data=f"addon:{pkg.id}")] for pkg in packages]
+                rows.append([InlineKeyboardButton(text="Выбрать валюту", callback_data="currencies:buy:0")])
                 back_keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
                 rows.extend(back_keyboard.inline_keyboard if back_keyboard else [])
                 keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
@@ -251,14 +328,11 @@ async def show_menu(target, parent_id: int | None):
                                      "Для применения маршрутов нужна активная подписка и настроенный публичный HTTPS-адрес панели.")
             else:
                 keyboard = menu_keyboard(db, node.id, telegram_id=telegram_id)
-        if parent_id is None and not keyboard:
-            plans = db.scalars(select(Plan).where(Plan.enabled.is_(True), Plan.show_in_bot.is_(True))).all()
-            rows = [[InlineKeyboardButton(text=f"{p.name} — {p.amount} {p.currency}", callback_data=f"buy:{p.id}")]
-                    for p in plans]
-            base = get_config("public_base_url").rstrip("/")
-            if is_public_http_url(base):
-                rows.append([InlineKeyboardButton(text="Договор оферты", url=f"{base}/offer")])
-            keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+        if parent_id is None and not db.scalar(select(BotMenuNode.id).where(
+                BotMenuNode.parent_id.is_(None), BotMenuNode.enabled.is_(True)).limit(1)):
+            text, keyboard = catalog_view(db, telegram_id)
+            if not _trial_already_used(db, telegram_id):
+                keyboard.inline_keyboard.append([InlineKeyboardButton(text="Пробный период · 3 дня", callback_data="trial:0")])
     if isinstance(target, Message):
         await target.answer(text, reply_markup=keyboard)
     else:
@@ -462,14 +536,27 @@ async def switch_plan(callback: CallbackQuery):
 
 
 async def create_plan_order(callback: CallbackQuery, immediate_switch: bool):
-    plan_id = int(callback.data.split(":", 1)[1])
     try:
+        parts = callback.data.split(":")
+        plan_id = int(parts[1])
         switch_now = immediate_switch
         with SessionLocal() as db:
             plan = db.get(Plan, plan_id)
             if not plan or not plan.enabled or not plan.show_in_bot:
                 await callback.answer("Тариф недоступен", show_alert=True)
                 return
+            if selected_currency(db, callback.from_user.id) != plan.currency:
+                await callback.message.answer("Выберите валюту оплаты:", reply_markup=currency_keyboard("switch" if immediate_switch else "buy"))
+                await callback.answer()
+                return
+            if len(parts) != 3:
+                await callback.message.answer("Выберите период тарифа:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=f"{period_label(p)} — {p.amount} {plan.currency}", callback_data=f"{parts[0]}:{plan.id}:{p.id}")]
+                    for p in periods_for(db, plan.id)]))
+                await callback.answer()
+                return
+            period = db.get(PlanPeriod, int(parts[2]))
+            plan = period_plan(plan, period)
             current = db.get(Subscription, callback.from_user.id)
             current_expiry = (current.expires_at.replace(tzinfo=timezone.utc) if current and current.expires_at.tzinfo is None
                               else (current.expires_at if current else None))
@@ -536,7 +623,7 @@ async def create_plan_order(callback: CallbackQuery, immediate_switch: bool):
             await callback.answer()
             return
         with SessionLocal() as db:
-            invoice_id, pay_url = new_checkout(db, plan.name, charge, plan.currency)
+            invoice_id, pay_url = new_checkout(db, f"{plan.name} · {period_label(period)}", charge, plan.currency)
             db.add(PendingPayment(invoice_id=invoice_id, telegram_id=callback.from_user.id,
                                   plan_id=plan_id, product_type="plan", charged_amount=charge,
                                   credit_amount=credit, immediate_switch=switch_now,
@@ -559,6 +646,9 @@ async def buy_addon(callback: CallbackQuery):
         package_id = int(callback.data.split(":", 1)[1])
         with SessionLocal() as db:
             package = db.get(AddonPackage, package_id)
+            if package and selected_currency(db, callback.from_user.id) != package.currency:
+                await callback.answer("Выберите валюту пакета в меню бота", show_alert=True)
+                return
             sub = db.get(Subscription, callback.from_user.id)
             expires = sub.expires_at.replace(tzinfo=timezone.utc) if sub and sub.expires_at.tzinfo is None else (sub.expires_at if sub else None)
             if not package or not package.enabled or not sub or not sub.enabled or not expires or expires <= datetime.now(timezone.utc) or not sub.traffic_limit_bytes:

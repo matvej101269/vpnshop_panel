@@ -1,30 +1,25 @@
-<div class="title-row"><div><h1>Подписки и тарифы</h1><div class="subtitle">Срок, стоимость, трафик, устройства и видимость тарифов в боте</div></div></div>
-<section class="section"><div class="section-head"><div><h2>Новый тариф</h2><p>0 ГБ — без ограничений. Сброс задаётся в 3x-ui при создании клиента.</p></div></div>
-<form method="post" action="/admin/subscriptions" class="form-panel">
+<div class="title-row"><div><h1>Подписки и тарифы</h1><div class="subtitle">Валюта тарифа, периоды и отдельная цена каждого периода</div></div></div>
+{% macro fields(p, periods) %}
 <div class="plan-fields">
-<label>Название<input name="name" required maxlength="100"></label>
-<label>Дней<input name="days" type="number" min="1" required><small>Срок подписки</small></label>
-<label>Цена<input name="amount" type="number" min="1" required></label>
-<label>Валюта<input name="currency" value="RUB" maxlength="8"></label>
-<label>Трафик, ГБ<input name="traffic_limit_gb" type="number" min="0" step="0.1" value="0"><small>0 — без ограничений</small></label>
-<label>Количество устройств<input name="limit_hwid" type="number" min="0" value="0"><small>0 — без ограничений</small></label>
-<label>Сброс трафика<select name="traffic_reset"><option value="never">Никогда</option><option value="hourly">Ежечасно</option><option value="daily">Ежедневно</option><option value="weekly">Еженедельно</option><option value="monthly">Ежемесячно</option></select></label>
-<label class="check-label"><input type="checkbox" name="enabled" checked> Включён</label>
-<label class="check-label"><input type="checkbox" name="show_in_bot" checked> Отображать в боте</label>
-</div><button>Создать тариф</button></form></section>
-
-<section class="section"><div class="section-head"><div><h2>Тарифы</h2><p>Снятие «Отображать в боте» оставляет тариф доступным для ручного подключения из панели.</p></div><span class="mini">{{plans|length}} тарифов</span></div>
-<div class="table-wrap"><table><thead><tr><th>НАЗВАНИЕ</th><th>ДНЕЙ</th><th>ЦЕНА</th><th>ВАЛЮТА</th><th>ТРАФИК, ГБ</th><th>УСТРОЙСТВА</th><th>СБРОС</th><th>БОТ</th><th>ВКЛЮЧЁН</th><th>ПОЛЬЗОВАТЕЛИ</th><th></th></tr></thead><tbody>
-{% for p in plans %}{% set form_id = 'plan-' ~ p.id %}<tr>
-<td><form id="{{form_id}}" method="post" action="/admin/subscriptions/{{p.id}}/edit"></form><input form="{{form_id}}" name="name" value="{{p.name}}" required></td>
-<td><input form="{{form_id}}" name="days" type="number" min="1" value="{{p.days}}" required style="width:75px"></td>
-<td><input form="{{form_id}}" name="amount" type="number" min="1" value="{{p.amount}}" required style="width:90px"></td>
-<td><input form="{{form_id}}" name="currency" value="{{p.currency}}" style="width:68px"></td>
-<td><label class="cell-field"><input form="{{form_id}}" name="traffic_limit_gb" type="number" min="0" step="0.1" value="{{p.traffic_limit_gb}}"><small>0 — без ограничений</small></label></td>
-<td><input form="{{form_id}}" name="limit_hwid" type="number" min="0" value="{{p.limit_hwid}}" style="width:85px" title="0 — без ограничений"></td>
-<td><select form="{{form_id}}" name="traffic_reset">{% for val,label in [('never','Никогда'),('hourly','Ежечасно'),('daily','Ежедневно'),('weekly','Еженедельно'),('monthly','Ежемесячно')] %}<option value="{{val}}" {{'selected' if p.traffic_reset == val else ''}}>{{label}}</option>{% endfor %}</select></td>
-<td><input form="{{form_id}}" type="checkbox" name="show_in_bot" {{'checked' if p.show_in_bot else ''}} aria-label="Отображать в боте"></td>
-<td><input form="{{form_id}}" type="checkbox" name="enabled" {{'checked' if p.enabled else ''}} aria-label="Тариф включён"></td>
-<td>{{plan_users[p.id]}}</td><td><div class="actions"><button form="{{form_id}}" class="btn-quiet">Сохранить</button>{% if plan_users[p.id] == 0 %}<form method="post" action="/admin/subscriptions/{{p.id}}/delete" onsubmit="return confirm('Удалить тариф {{p.name}}?')"><button class="btn-danger">Удалить</button></form>{% else %}<span class="mini">Используется</span>{% endif %}</div></td>
-</tr>{% else %}<tr><td colspan="11" class="empty">Добавьте первый тариф</td></tr>{% endfor %}</tbody></table></div></section>
-<style>.plan-fields{display:grid;grid-template-columns:repeat(3,minmax(150px,1fr));gap:14px;margin-bottom:16px}.plan-fields>label,.cell-field{display:flex;flex-direction:column;gap:6px;color:#bac4d0;font-size:12px}.plan-fields input,.plan-fields select{width:100%}.plan-fields small,.cell-field small{font-size:10px;color:var(--muted)}.plan-fields .check-label{flex-direction:row;align-items:center}.cell-field{min-width:125px}.actions form{display:inline}.actions{flex-wrap:wrap}@media(max-width:850px){.plan-fields{grid-template-columns:1fr 1fr}}</style>
+<label>Название<input name="name" required maxlength="100" value="{{p.name if p else ''}}"></label>
+<label>Валюта<select name="currency" required>{% for code in ['RUB','USD','EUR'] %}<option value="{{code}}" {{'selected' if p and p.currency == code else ''}}>{{code}}</option>{% endfor %}</select></label>
+<label>Трафик, ГБ<input name="traffic_limit_gb" type="number" min="0" step="0.1" value="{{p.traffic_limit_gb if p else 0}}"><small>0 — без ограничений</small></label>
+<label>Количество устройств<input name="limit_hwid" type="number" min="0" value="{{p.limit_hwid if p else 0}}"><small>0 — без ограничений</small></label>
+<label>Сброс трафика<select name="traffic_reset">{% for value,label in [('never','Никогда'),('hourly','Ежечасно'),('daily','Ежедневно'),('weekly','Еженедельно'),('monthly','Ежемесячно')] %}<option value="{{value}}" {{'selected' if p and p.traffic_reset == value else ''}}>{{label}}</option>{% endfor %}</select></label>
+<label class="check-label"><input type="checkbox" name="enabled" {{'checked' if not p or p.enabled else ''}}> Включён</label>
+<label class="check-label"><input type="checkbox" name="show_in_bot" {{'checked' if not p or p.show_in_bot else ''}}> Отображать в боте</label>
+</div>
+<fieldset class="periods"><legend>Период и полная цена</legend><p class="mini">Включите нужные варианты. 1 месяц = 30 дней, 3 = 90, 6 = 180. Цена указывается за весь период в валюте тарифа.</p>
+<div class="plan-fields">{% for months,label in [(1,'1 месяц'),(3,'3 месяца'),(6,'6 месяцев')] %}{% set period = periods.get(months) %}<div class="period-row">
+<label class="check-label"><input type="checkbox" name="period_{{months}}_enabled" {{'checked' if (period and period.enabled) or (not p and months == 1) else ''}}> {{label}}</label>
+<label>Цена за период<input name="period_{{months}}_amount" type="number" min="1" max="1000000" step="1" value="{{period.amount if period else ''}}" placeholder="Цена"></label></div>{% endfor %}
+{% set legacy = periods.get(0) %}{% if legacy %}<div class="period-row"><label class="check-label"><input type="checkbox" name="period_0_enabled" {{'checked' if legacy.enabled else ''}}> Сохранённый срок</label><label>Дней<input name="period_0_days" type="number" min="1" value="{{legacy.days}}"></label><label>Цена<input name="period_0_amount" type="number" min="1" max="1000000" value="{{legacy.amount}}"></label></div>{% endif %}
+</div></fieldset>
+{% endmacro %}
+<section class="section"><div class="section-head"><h2>Новый тариф</h2></div><form method="post" action="/admin/subscriptions" class="form-panel">{{fields(none,{})}}<button>Создать тариф</button></form></section>
+<section class="section"><div class="section-head"><h2>Тарифы</h2><span class="mini">{{plans|length}} тарифов</span></div>
+{% for p in plans %}<details class="plan-card"><summary><b>{{p.name}}</b> · {{p.currency}} · {{plan_users[p.id]}} пользователей {{'· Выключен' if not p.enabled else ''}}</summary>
+<form method="post" action="/admin/subscriptions/{{p.id}}/edit" class="form-panel">{{fields(p,plan_periods[p.id])}}<button>Сохранить</button></form>
+{% if plan_users[p.id] == 0 %}<form method="post" action="/admin/subscriptions/{{p.id}}/delete" onsubmit="return confirm('Удалить тариф?')"><button class="btn-danger">Удалить тариф</button></form>{% endif %}</details>
+{% else %}<p>Добавьте первый тариф.</p>{% endfor %}</section>
+<style>.plan-fields{display:grid;grid-template-columns:repeat(3,minmax(150px,1fr));gap:16px;margin-bottom:16px}.plan-fields label{display:flex;flex-direction:column;gap:6px;color:#bac4d0;font-size:12px}.plan-fields input,.plan-fields select{width:100%}.plan-fields .check-label{flex-direction:row;align-items:center}.check-label input{width:auto}.periods{border:1px solid var(--border);border-radius:8px;margin-bottom:18px;padding:16px}.period-row{display:grid;gap:10px}.plan-card{border:1px solid var(--border);border-radius:8px;margin-bottom:12px;padding:16px}.plan-card summary{cursor:pointer;padding:8px}.plan-fields small{color:var(--muted)}@media(max-width:850px){.plan-fields{grid-template-columns:1fr 1fr}}@media(max-width:520px){.plan-fields{grid-template-columns:1fr}}</style>

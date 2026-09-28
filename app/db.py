@@ -23,6 +23,23 @@ class Plan(Base):
     traffic_reset: Mapped[str] = mapped_column(String(16), default="never")
 
 
+class PlanPeriod(Base):
+    __tablename__ = "plan_periods"
+    __table_args__ = (Index("uq_plan_period_months", "plan_id", "months", unique=True),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    plan_id: Mapped[int] = mapped_column(Integer, index=True)
+    months: Mapped[int] = mapped_column(Integer)
+    days: Mapped[int] = mapped_column(Integer)
+    amount: Mapped[int] = mapped_column(Integer)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class UserCurrency(Base):
+    __tablename__ = "user_currencies"
+    telegram_id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
+    currency: Mapped[str] = mapped_column(String(3))
+
+
 class BotMenuNode(Base):
     """Admin-authored Telegram menu tree; contains no subscriber data."""
     __tablename__ = "bot_menu_nodes"
@@ -384,6 +401,9 @@ def init_db():
             db.commit()
         # Attach older subscriptions to the matching current plan when possible.
         for plan in db.query(Plan).all():
+            if not db.query(PlanPeriod).filter(PlanPeriod.plan_id == plan.id).first():
+                db.add(PlanPeriod(plan_id=plan.id, months={30: 1, 90: 3, 180: 6}.get(plan.days, 0),
+                                  days=plan.days, amount=plan.amount, enabled=True))
             db.query(Subscription).filter(
                 Subscription.plan_id.is_(None), Subscription.plan_name == plan.name
             ).update({Subscription.plan_id: plan.id}, synchronize_session=False)

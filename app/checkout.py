@@ -16,7 +16,7 @@ from sqlalchemy import select, update
 from app.db import Checkout, CheckoutQuote, PaymentAttempt, PendingPayment, SessionLocal
 from app.runtime_config import get_config
 from app.services import LavaClient
-from app.payment_options import METHODS, exchange_rates, convert_amount, amount_limit_error
+from app.payment_options import METHODS, amount_limit_error
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -77,7 +77,6 @@ def legacy_attempt(db, row):
 
 
 async def render_page(token, request, *, error="", status=200):
-    currency = request.query_params.get("currency", "")
     with SessionLocal() as db:
         row = get_checkout(db, token)
         state = row.state
@@ -86,21 +85,17 @@ async def render_page(token, request, *, error="", status=200):
         if state in {"open", "ready", "failed"} and row.created_at < now() - timedelta(hours=24):
             state = "expired"
         choose = state in {"open", "failed"} or (state == "ready" and request.query_params.get("change") == "1")
-        currency = currency if currency in METHODS else row.currency
+        currency = row.currency
         quote = None
         if choose:
             quote = db.scalar(select(CheckoutQuote).where(
                 CheckoutQuote.checkout_token == token, CheckoutQuote.currency == currency,
                 CheckoutQuote.expires_at > now()
             ).order_by(CheckoutQuote.expires_at.desc()).limit(1))
-        base_amount, base_currency = row.amount, row.currency
+        base_amount = row.amount
     if choose and quote is None:
         try:
-            if currency == base_currency:
-                amount, rate, day = Decimal(base_amount), Decimal(1), ""
-            else:
-                rates, day = await exchange_rates()
-                amount, rate = convert_amount(base_amount, base_currency, currency, rates)
+            amount, rate, day = Decimal(base_amount), Decimal(1), ""
             with SessionLocal() as db:
                 quote = CheckoutQuote(token=secrets.token_urlsafe(32), checkout_token=token,
                                       amount=amount, currency=currency, rate=rate, rate_date=day,
@@ -108,8 +103,8 @@ async def render_page(token, request, *, error="", status=200):
                 db.add(quote)
                 db.commit()
         except Exception as exc:
-            logger.warning("Checkout exchange rate unavailable (%s)", type(exc).__name__)
-            error = "Не удалось получить курс. Выберите исходную валюту заказа или повторите позже."
+            logger.warning("Checkout quote unavailable (%s)", type(exc).__name__)
+            error = "Не удалось подготовить заказ. Повторите позже."
     with SessionLocal() as db:
         row = get_checkout(db, token)
         if row.state == "paid":
@@ -120,7 +115,7 @@ async def render_page(token, request, *, error="", status=200):
         extra_paid = any(a.state == "extra_paid" for a in attempts)
         return templates.TemplateResponse(request, "checkout.html", {
             "checkout": row, "state": state, "choose": choose, "error": error,
-            "currency": currency, "currencies": list(METHODS), "methods": METHODS[currency],
+            "currency": currency, "methods": METHODS[currency],
             "quote": quote, "active": active, "extra_paid": extra_paid,
             "limit_error": amount_limit_error(quote.amount, quote.currency) if quote else "",
         }, status_code=status, headers=HEADERS)
@@ -148,6 +143,8 @@ async def choose_method(token: str, request: Request):
             return await render_page(token, request, error="Цена устарела. Проверьте обновлённую сумму и выберите способ ещё раз.", status=409)
         if method not in METHODS.get(quote.currency, {}):
             raise HTTPException(400, "Способ недоступен для выбранной валюты")
+        if quote.currency != row.currency or quote.amount != Decimal(row.amount):
+            raise HTTPException(409, "Валюта и цена выбираются в боте. Откройте страницу заказа заново.")
         limit_error = amount_limit_error(quote.amount, quote.currency)
         if limit_error:
             return await render_page(token, request, error=limit_error, status=400)

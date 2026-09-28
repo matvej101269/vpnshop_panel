@@ -34,6 +34,8 @@ from app.runtime_config import (init_runtime_config, get_config, save_config, co
 from app.runtime_config import decrypt_handoff
 from app.checkout import router as checkout_router, matches_payment, legacy_attempt
 from app.db import Checkout, PaymentAttempt
+from app.db import PlanPeriod
+from app.plan_catalog import CURRENCIES, parse_periods, save_periods, periods_for, period_plan, period_label
 
 templates = Jinja2Templates(directory="app/templates")
 logger = logging.getLogger(__name__)
@@ -640,9 +642,12 @@ async def admin_page(section: str, request: Request, page: int = Query(1, ge=1),
             ctx.update(rows=rows, page=page, page_count=page_count, total_users=total,
                        sort=sort, direction=direction)
             ctx["manual_plans"] = db.scalars(select(Plan).where(Plan.enabled.is_(True)).order_by(Plan.days)).all()
+            ctx["manual_periods"] = {p.id: periods_for(db, p.id) for p in ctx["manual_plans"]}
+            ctx["period_label"] = period_label
         elif section == "subscriptions":
             plans = db.scalars(select(Plan).order_by(Plan.days)).all()
             ctx["plans"] = plans
+            ctx["plan_periods"] = {p.id: {r.months: r for r in db.scalars(select(PlanPeriod).where(PlanPeriod.plan_id == p.id))} for p in plans}
             by_plan = dict(db.execute(select(Subscription.plan_id, func.count())
                                       .where(Subscription.plan_id.is_not(None))
                                       .group_by(Subscription.plan_id)).all())
@@ -729,7 +734,7 @@ def validate_menu_values(form, db, current_id: int | None = None):
     parent_raw = str(form.get("parent_id", "")).strip()
     if not label or len(label) > 64:
         raise HTTPException(status_code=400, detail="Название кнопки должно быть от 1 до 64 символов")
-    if action not in {"menu", "plans", "change_plan", "subscription_info", "addons", "offer", "url", "open_happ", "routing", "trial", "promo", "referral"}:
+    if action not in {"menu", "currency", "plans", "change_plan", "subscription_info", "addons", "offer", "url", "open_happ", "routing", "trial", "promo", "referral"}:
         raise HTTPException(status_code=400, detail="Неизвестное действие кнопки")
     parent_id = int(parent_raw) if parent_raw.isdigit() and int(parent_raw) > 0 else None
     if parent_id is not None:
@@ -896,18 +901,32 @@ async def save_referral_settings(request: Request, _: None = Depends(admin)):
     return RedirectResponse("/admin/referrals", status_code=303)
 
 
+def checked_plan_periods(form):
+    currency = str(form.get("currency", "")).strip().upper()
+    if currency not in CURRENCIES:
+        raise HTTPException(status_code=400, detail="Выберите RUB, USD или EUR")
+    try:
+        return currency, parse_periods(form)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/admin/subscriptions")
 async def create_plan(request: Request, _: None = Depends(admin)):
     form = await checked_form(request)
+    currency, period_values = checked_plan_periods(form)
     traffic_reset = str(form.get("traffic_reset", "never"))
     if traffic_reset not in {"never", "hourly", "daily", "weekly", "monthly"}:
         raise HTTPException(status_code=400, detail="Некорректный период сброса трафика")
     with SessionLocal() as db:
-        db.add(Plan(name=str(form["name"]).strip(), days=int(form["days"]), amount=int(form["amount"]),
-                    currency=str(form.get("currency", "RUB")).strip().upper(),
+        plan = Plan(name=str(form["name"]).strip(), days=period_values[0][1], amount=period_values[0][2],
+                    currency=currency,
                     traffic_limit_gb=float(form.get("traffic_limit_gb", 0)),
                     limit_hwid=max(0, int(form.get("limit_hwid", 0))), traffic_reset=traffic_reset,
-                    show_in_bot=form.get("show_in_bot") == "on"))
+                    show_in_bot=form.get("show_in_bot") == "on", enabled=form.get("enabled") == "on")
+        db.add(plan)
+        db.flush()
+        save_periods(db, plan, period_values)
         db.commit()
     return RedirectResponse("/admin/subscriptions", status_code=303)
 
@@ -1072,6 +1091,7 @@ async def update_bot_content(request: Request, _: None = Depends(admin)):
 @app.post("/admin/subscriptions/{plan_id}/edit")
 async def edit_plan(plan_id: int, request: Request, _: None = Depends(admin)):
     form = await checked_form(request)
+    currency, period_values = checked_plan_periods(form)
     traffic_reset = str(form.get("traffic_reset", "never"))
     if traffic_reset not in {"never", "hourly", "daily", "weekly", "monthly"}:
         raise HTTPException(status_code=400, detail="Некорректный период сброса трафика")
@@ -1083,9 +1103,8 @@ async def edit_plan(plan_id: int, request: Request, _: None = Depends(admin)):
         new_name = str(form["name"]).strip()
         renamed = new_name != plan.name
         plan.name = new_name
-        plan.days = int(form["days"])
-        plan.amount = int(form["amount"])
-        plan.currency = str(form.get("currency", "RUB")).strip().upper()
+        plan.currency = currency
+        save_periods(db, plan, period_values)
         plan.traffic_limit_gb = float(form.get("traffic_limit_gb", 0))
         plan.enabled = form.get("enabled") == "on"
         plan.show_in_bot = form.get("show_in_bot") == "on"
@@ -1144,6 +1163,7 @@ async def delete_plan(plan_id: int, request: Request, _: None = Depends(admin)):
                 promo.plan_ids = ",".join(map(str, selected))
                 if not selected:
                     promo.expires_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db.query(PlanPeriod).filter(PlanPeriod.plan_id == plan_id).delete(synchronize_session=False)
         db.delete(plan)
         db.commit()
     return RedirectResponse("/admin/subscriptions", status_code=303)
@@ -1155,13 +1175,20 @@ async def create_user(request: Request, _: None = Depends(admin)):
     telegram_id = int(form["telegram_id"])
     now = datetime.now(timezone.utc)
     sub_id = uuid.uuid4().hex[:20]
-    plan_id = int(form.get("plan_id", 0))
+    selection = str(form.get("plan_id", "0")).split(":")
+    plan_id = int(selection[0])
     with SessionLocal() as db:
         if db.get(Subscription, telegram_id):
             raise HTTPException(status_code=409, detail="Telegram ID already exists")
         plan = db.get(Plan, plan_id)
         if not plan or not plan.enabled:
             raise HTTPException(status_code=400, detail="Выберите действующий тариф")
+        if len(selection) != 2:
+            raise HTTPException(status_code=400, detail="Выберите период тарифа")
+        try:
+            plan = period_plan(plan, db.get(PlanPeriod, int(selection[1])))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         days, title, price, currency = plan.days, plan.name, plan.amount, plan.currency
         traffic_bytes = int(plan.traffic_limit_gb * (1024 ** 3))
         expires = now + timedelta(days=days)

@@ -6,10 +6,9 @@
 <div class="tag">Оплата заказа</div><h1>{{ checkout.title }}</h1>
 {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
 {% if choose %}
-<nav class="currencies" aria-label="Валюта оплаты">{% for code in currencies %}<a href="?change=1&amp;currency={{code}}" aria-current="{{ 'true' if code == currency else 'false' }}">{{code}}</a>{% endfor %}</nav>
+<p class="muted">Валюта заказа: {{currency}}. Для другой валюты выберите тариф в боте.</p>
 {% if quote %}
 <div class="price">{{ '%.2f'|format(quote.amount) }} {{ quote.currency }}</div>
-{% if quote.rate_date %}<p class="muted">Исходная цена: {{checkout.amount}} {{checkout.currency}}. Пересчёт по курсу ЦБ от {{quote.rate_date}}, без наценки. Цена для создания счёта фиксируется на 15 минут. Банк может применить свою конвертацию и комиссию.</p>{% endif %}
 {% if limit_error %}<p class="notice" role="status">{{limit_error}}</p>{% else %}
 <p>Выберите способ оплаты</p>
 {% for method, info in methods.items() %}
@@ -31,7 +30,7 @@
 <p>Счёт создан. Оплатите его в открывшейся вкладке.</p>
 <a class="button" target="_blank" rel="noopener" href="{{checkout.payment_url}}">Продолжить оплату</a>
 <a class="button secondary" href="?change=1">Сменить способ оплаты</a>
-<p class="muted">Вы можете выбрать другую валюту и способ. Если деньги уже списаны, не оплачивайте повторно.</p>
+<p class="muted">Вы можете выбрать другой способ в валюте заказа. Если деньги уже списаны, не оплачивайте повторно.</p>
 {% elif state == 'paid' %}
 <h2>Оплата получена</h2><p>Вернитесь в Telegram. Бот пришлёт подтверждение после подключения услуги.</p>
 {% if extra_paid %}<p class="error">По заказу получена дополнительная оплата. Обратитесь в поддержку для проверки возврата.</p>{% endif %}
